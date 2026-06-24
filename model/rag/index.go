@@ -86,10 +86,15 @@ func Index(inst *instance.Instance, logger logger.Logger, msg IndexMessage) erro
 		return nil
 	}
 
+	flags, err := feature.GetFlags(inst)
+	if err != nil {
+		return fmt.Errorf("rag: get feature flags: %w", err)
+	}
+
 	var errj error
 	for _, change := range feed.Results {
-		if err := callRAGIndexer(inst, msg.Doctype, change); err != nil {
-			logger.Warnf("Index error: %s", err)
+		if err := callRAGIndexer(inst, msg.Doctype, change, flags); err != nil {
+			logger.Errorf("rag: skipping change for file %s: %s", change.DocID, err)
 			errj = errors.Join(errj, err)
 		}
 	}
@@ -102,7 +107,7 @@ func Index(inst *instance.Instance, logger logger.Logger, msg IndexMessage) erro
 	return errj
 }
 
-func callRAGIndexer(inst *instance.Instance, doctype string, change couchdb.Change) error {
+func callRAGIndexer(inst *instance.Instance, doctype string, change couchdb.Change, flags *feature.Flags) error {
 	if strings.HasPrefix(change.DocID, "_design/") {
 		return nil
 	}
@@ -110,11 +115,8 @@ func callRAGIndexer(inst *instance.Instance, doctype string, change couchdb.Chan
 		return nil
 	}
 
-	flags, err := feature.GetFlags(inst)
-	if err != nil {
-		return err
-	}
-	if !isClassAllowed(flags, change.Doc.Get("class").(string)) {
+	class, _ := change.Doc.Get("class").(string)
+	if !isClassAllowed(flags, class) {
 		return nil
 	}
 
