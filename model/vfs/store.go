@@ -88,7 +88,6 @@ func (s *memStore) AddFile(db prefixer.Prefixer, filePath string) (string, error
 	return s.AddFileWithTTL(db, filePath, storeTTL)
 }
 
-// AddFileWithTTL stores filePath behind a fresh secret that expires after ttl.
 func (s *memStore) AddFileWithTTL(db prefixer.Prefixer, filePath string, ttl time.Duration) (string, error) {
 	key := makeSecret()
 	s.mu.Lock()
@@ -265,7 +264,6 @@ func (s *redisStore) AddFile(db prefixer.Prefixer, filePath string) (string, err
 	return s.AddFileWithTTL(db, filePath, storeTTL)
 }
 
-// AddFileWithTTL stores filePath behind a fresh secret that expires after ttl.
 func (s *redisStore) AddFileWithTTL(db prefixer.Prefixer, filePath string, ttl time.Duration) (string, error) {
 	key := makeSecret()
 	if err := s.c.Set(s.ctx, db.DBPrefix()+":"+key, filePath, ttl).Err(); err != nil {
