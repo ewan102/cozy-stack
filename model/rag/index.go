@@ -1,15 +1,14 @@
 package rag
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"mime/multipart"
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/cozy/cozy-stack/model/feature"
 	"github.com/cozy/cozy-stack/model/instance"
@@ -24,9 +23,41 @@ import (
 	"github.com/labstack/echo/v4"
 )
 
+// RAGIndexMessage is the payload published to the RAG index broker for each
+// file change. The consumer is rag-indexer (producer.py), which expects the
+// "cozy-json" format with snake_case JSON keys.
+//
+// Unlike other broker messages in pkg/rabbitmq/contracts.go that use camelCase,
+// snake_case is used here to match the rag-indexer Python contract.
+//
+// Content is sent in one of two ways:
+//   - note_markdown: pre-rendered markdown for io.cozy.notes; the indexer
+//     reads it directly without downloading the file.
+//   - file_url: rag-indexer downloads the file autonomously from a
+//     self-authenticated URL whose secret grants time-limited read access.
+type RAGIndexMessage struct {
+	Action       string `json:"action"`
+	Partition    string `json:"partition"`
+	FileID       string `json:"file_id"`
+	Doctype      string `json:"doctype"`
+	CallbackURL  string `json:"callback_url"`
+	RAGBaseURL   string `json:"rag_base_url"`
+	RAGAPIKey    string `json:"rag_api_key"`
+	MD5Sum       string `json:"md5sum,omitempty"`
+	Name         string `json:"name,omitempty"`
+	DirID        string `json:"dir_id,omitempty"`
+	Datetime     string `json:"datetime,omitempty"`
+	ContentType  string `json:"content_type,omitempty"`
+	FileURL      string `json:"file_url,omitempty"`
+	NoteMarkdown string `json:"note_markdown,omitempty"`
+}
+
 // BatchSize is the maximal number of documents manipulated at once by the
 // worker.
 const BatchSize = 100
+
+// fileURLTTL covers the rag-indexer DLQ retry budget with margin.
+const fileURLTTL = 70 * time.Minute
 
 type IndexMessage struct {
 	Doctype string `json:"doctype"`
@@ -75,31 +106,15 @@ func callRAGIndexer(inst *instance.Instance, doctype string, change couchdb.Chan
 	if strings.HasPrefix(change.DocID, "_design/") {
 		return nil
 	}
-	flags, err := feature.GetFlags(inst)
-	class, _ := change.Doc.Get("class").(string)
-
-	if class == consts.ImageClass {
-		// Index images only if flag allows it
-		allowImage, ok := flags.M["rag.index.image.enabled"].(bool)
-		if !ok || !allowImage {
-			return nil
-		}
-	}
-	if class == consts.VideoClass {
-		// Index videos only if flag allows it
-		allowVideo, ok := flags.M["rag.index.video.enabled"].(bool)
-		if !ok || !allowVideo {
-			return nil
-		}
-	}
-	if class == consts.AudioClass {
-		// Index audio only if flag allows it
-		allowAudio, ok := flags.M["rag.index.audio.enabled"].(bool)
-		if !ok || !allowAudio {
-			return nil
-		}
-	}
 	if change.Doc.Get("type") == consts.DirType {
+		return nil
+	}
+
+	flags, err := feature.GetFlags(inst)
+	if err != nil {
+		return err
+	}
+	if !isClassAllowed(flags, change.Doc.Get("class").(string)) {
 		return nil
 	}
 
@@ -107,188 +122,186 @@ func callRAGIndexer(inst *instance.Instance, doctype string, change couchdb.Chan
 	if ragServer.URL == "" {
 		return errors.New("no RAG server configured")
 	}
-	u, err := url.Parse(ragServer.URL)
+
+	callbackURL, err := cachedWebhookURL(inst)
+	if err != nil {
+		return fmt.Errorf("rag ensure webhook: %w", err)
+	}
+
+	log := inst.Logger().WithNamespace("rag")
+
+	if change.Deleted || change.Doc.Get("trashed") == true {
+		return publishDelete(inst, doctype, change.DocID, callbackURL, ragServer, log)
+	}
+
+	md5sum := fmt.Sprintf("%x", change.Doc.Get("md5sum"))
+	needed, err := needsIndexation(ragServer, inst.Domain, change.DocID, md5sum)
 	if err != nil {
 		return err
 	}
-	u.Path = fmt.Sprintf("/indexer/partition/%s/file/%s", inst.Domain, change.DocID)
-	if change.Deleted || change.Doc.Get("trashed") == true {
-		// Doc deletion
-		req, err := http.NewRequest(http.MethodDelete, u.String(), nil)
-		if err != nil {
-			return err
+	if !needed {
+		// TODO we should patch the metadata in the vector db when a
+		// file has been moved/renamed.
+		log.Debugf("rag: skip file %s (content unchanged)", change.DocID)
+		return nil
+	}
+
+	return publishUpsert(inst, doctype, change, md5sum, callbackURL, ragServer, log)
+}
+
+func isClassAllowed(flags *feature.Flags, class string) bool {
+	switch class {
+	case consts.ImageClass:
+		v, _ := flags.M["rag.index.image.enabled"].(bool)
+		return v
+	case consts.VideoClass:
+		v, _ := flags.M["rag.index.video.enabled"].(bool)
+		return v
+	case consts.AudioClass:
+		v, _ := flags.M["rag.index.audio.enabled"].(bool)
+		return v
+	}
+	return true
+}
+
+func publishDelete(inst *instance.Instance, doctype, fileID, callbackURL string, ragServer config.RAGServer, log logger.Logger) error {
+	log.Debugf("rag: publish delete for file %s", fileID)
+	msg := RAGIndexMessage{
+		Action:      "delete",
+		Partition:   inst.Domain,
+		FileID:      fileID,
+		Doctype:     doctype,
+		CallbackURL: callbackURL,
+		RAGBaseURL:  ragServer.URL,
+		RAGAPIKey:   ragServer.APIKey,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := broker.Publish(ctx, inst.ContextName, msg); err != nil {
+		return fmt.Errorf("rag publish delete: %w", err)
+	}
+	return nil
+}
+
+// needsIndexation checks the RAG server to see if the file content has changed
+// since the last indexation. Returns true when the file must be (re-)indexed.
+func needsIndexation(ragServer config.RAGServer, domain, fileID, md5sum string) (bool, error) {
+	u, err := url.Parse(ragServer.URL)
+	if err != nil {
+		return false, err
+	}
+	u.Path = fmt.Sprintf("/partition/%s/file/%s", domain, fileID)
+	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
+	if err != nil {
+		return false, err
+	}
+	req.Header.Add(echo.HeaderAuthorization, "Bearer "+ragServer.APIKey)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer res.Body.Close()
+
+	switch res.StatusCode {
+	case http.StatusOK:
+		var response map[string]interface{}
+		if err = json.NewDecoder(res.Body).Decode(&response); err != nil {
+			return false, err
 		}
-		req.Header.Add(echo.HeaderAuthorization, "Bearer "+ragServer.APIKey)
-		res, err := http.DefaultClient.Do(req)
-		if err != nil {
-			return err
+		metadata, ok := response["metadata"].(map[string]interface{})
+		if !ok {
+			return true, nil
 		}
-		defer res.Body.Close()
-		if res.StatusCode >= 500 {
-			return fmt.Errorf("DELETE status code: %d", res.StatusCode)
+		md5sumFromRAG, ok := metadata["md5sum"].(string)
+		if !ok {
+			return true, nil
+		}
+		return md5sumFromRAG != md5sum, nil
+	case http.StatusNotFound:
+		return true, nil
+	default:
+		return false, fmt.Errorf("GET status code: %d", res.StatusCode)
+	}
+}
+
+func publishUpsert(inst *instance.Instance, doctype string, change couchdb.Change, md5sum, callbackURL string, ragServer config.RAGServer, log logger.Logger) error {
+	name, _ := change.Doc.Get("name").(string)
+	mime, _ := change.Doc.Get("mime").(string)
+	dirID, _ := change.Doc.Get("dir_id").(string)
+	metadataRaw, _ := change.Doc.Get("metadata").(map[string]interface{})
+	datetime, _ := metadataRaw["datetime"].(string)
+
+	msg := RAGIndexMessage{
+		Action:      "upsert",
+		Partition:   inst.Domain,
+		FileID:      change.DocID,
+		Doctype:     doctype,
+		MD5Sum:      md5sum,
+		Name:        name,
+		DirID:       dirID,
+		Datetime:    datetime,
+		ContentType: mime,
+		CallbackURL: callbackURL,
+		RAGBaseURL:  ragServer.URL,
+		RAGAPIKey:   ragServer.APIKey,
+	}
+
+	if mime == consts.NoteMimeType {
+		if err := fillNoteContent(inst, change, &msg); err != nil {
+			return err
 		}
 	} else {
-		md5sum := fmt.Sprintf("%x", change.Doc.Get("md5sum"))
-		u.Path = fmt.Sprintf("/partition/%s/file/%s", inst.Domain, change.DocID)
-		req, err := http.NewRequest(http.MethodGet, u.String(), nil)
-		if err != nil {
-			return err
-		}
-		req.Header.Add(echo.HeaderAuthorization, "Bearer "+ragServer.APIKey)
-		res, err := http.DefaultClient.Do(req)
-		if err != nil {
-			return err
-		}
-		defer res.Body.Close()
-
-		// When the content has not changed, there is no need to regenerate
-		// an embedding.
-		needIndexation := false
-		isNewFile := false
-		switch res.StatusCode {
-		case 200:
-			var response map[string]interface{}
-			if err = json.NewDecoder(res.Body).Decode(&response); err != nil {
-				return err
-			}
-			metadata, ok := response["metadata"].(map[string]interface{})
-			if !ok {
-				needIndexation = true
-			}
-			md5sumFromRAG, ok := metadata["md5sum"].(string)
-			if !ok {
-				needIndexation = true
-			}
-			needIndexation = md5sumFromRAG != md5sum
-
-		case 404:
-			needIndexation = true
-			isNewFile = true
-		default:
-			return fmt.Errorf("GET status code: %d", res.StatusCode)
-		}
-		if !needIndexation {
-			// TODO we should patch the metadata in the vector db when a
-			// file has been moved/renamed.
-			return nil
-		}
-
-		dirID, _ := change.Doc.Get("dir_id").(string)
-		name, _ := change.Doc.Get("name").(string)
-		mime, _ := change.Doc.Get("mime").(string)
-		metadataRaw, ok := change.Doc.Get("metadata").(map[string]interface{})
-		datetime := ""
-		if ok {
-			datetime, _ = metadataRaw["datetime"].(string)
-		}
-		internalID, _ := change.Doc.Get("internal_vfs_id").(string)
-		var content io.Reader
-
-		if mime == consts.NoteMimeType {
-			metadata, _ := change.Doc.Get("metadata").(map[string]interface{})
-			schema, _ := metadata["schema"].(map[string]interface{})
-			raw, _ := metadata["content"].(map[string]interface{})
-			noteDoc := &note.Document{
-				DocID:      change.DocID,
-				SchemaSpec: schema,
-				RawContent: raw,
-			}
-			md, err := noteDoc.Markdown(nil)
-			if err != nil {
-				return err
-			}
-			content = bytes.NewReader(md)
+		if strings.HasSuffix(name, consts.DocsExtension) {
 			// See https://github.com/OpenLLM-France/RAGondin/issues/88
-			name = strings.TrimSuffix(name, consts.NoteExtension) + consts.MarkdownExtension
-		} else {
-			fs := inst.VFS()
-			fileDoc := &vfs.FileDoc{
-				Type:       consts.FileType,
-				DocID:      change.DocID,
-				DirID:      dirID,
-				DocName:    name,
-				InternalID: internalID,
-			}
-			f, err := fs.OpenFile(fileDoc)
-			if err != nil {
-				return err
-			}
-			defer f.Close()
-			content = f
-			if strings.HasSuffix(name, consts.DocsExtension) {
-				// See https://github.com/OpenLLM-France/RAGondin/issues/88
-				name = strings.TrimSuffix(name, consts.DocsExtension) + consts.MarkdownExtension
-			}
+			msg.Name = strings.TrimSuffix(name, consts.DocsExtension) + consts.MarkdownExtension
 		}
-
-		u.RawQuery = url.Values{
-			"dir_id": []string{dirID},
-			"name":   []string{name},
-			"md5sum": []string{md5sum},
-		}.Encode()
-		u.Path = fmt.Sprintf("/indexer/partition/%s/file/%s", inst.Domain, change.DocID)
-
-		// Create pipe and writer for file streaming
-		pr, pw := io.Pipe()
-		writer := multipart.NewWriter(pw)
-
-		go func() {
-			part, err := writer.CreateFormFile("file", name)
-			if err != nil {
-				_ = pw.CloseWithError(err)
-				return
-			}
-			if _, err := io.Copy(part, content); err != nil {
-				_ = pw.CloseWithError(err)
-				return
-			}
-
-			// No need to add filename here, it is already set through the file form
-			meta := map[string]string{
-				"md5sum":   md5sum,
-				"datetime": datetime,
-				"doctype":  doctype,
-			}
-			ragMetadata, err := json.Marshal(meta)
-			if err != nil {
-				_ = pw.CloseWithError(err)
-				return
-			}
-			if err := writer.WriteField("metadata", string(ragMetadata)); err != nil {
-				_ = pw.CloseWithError(err)
-				return
-			}
-			defer pw.Close()
-			defer writer.Close()
-		}()
-
-		if isNewFile {
-			req, err = http.NewRequest(http.MethodPost, u.String(), pr)
-		} else {
-			req, err = http.NewRequest(http.MethodPut, u.String(), pr)
-		}
-		if err != nil {
+		if err := fillFileURL(inst, change.DocID, &msg); err != nil {
 			return err
-		}
-
-		req.Header.Add(echo.HeaderAuthorization, "Bearer "+ragServer.APIKey)
-		req.Header.Add("Content-Type", writer.FormDataContentType())
-
-		res, err = http.DefaultClient.Do(req)
-		if err != nil {
-			return err
-		}
-
-		var response map[string]interface{}
-		if err := json.NewDecoder(res.Body).Decode(&response); err != nil {
-			return err
-		}
-		defer res.Body.Close()
-
-		if res.StatusCode >= 500 {
-			return fmt.Errorf("Status code: %d", res.StatusCode)
 		}
 	}
+
+	log.Debugf("rag: publish upsert for file %s (%s)", change.DocID, msg.Name)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := broker.Publish(ctx, inst.ContextName, msg); err != nil {
+		return fmt.Errorf("rag publish upsert: %w", err)
+	}
+	return nil
+}
+
+func fillNoteContent(inst *instance.Instance, change couchdb.Change, msg *RAGIndexMessage) error {
+	metadata, _ := change.Doc.Get("metadata").(map[string]interface{})
+	schema, _ := metadata["schema"].(map[string]interface{})
+	raw, _ := metadata["content"].(map[string]interface{})
+	noteDoc := &note.Document{
+		DocID:      change.DocID,
+		SchemaSpec: schema,
+		RawContent: raw,
+	}
+	md, err := noteDoc.Markdown(nil)
+	if err != nil {
+		return err
+	}
+	msg.NoteMarkdown = string(md)
+	// See https://github.com/OpenLLM-France/RAGondin/issues/88
+	msg.Name = strings.TrimSuffix(msg.Name, consts.NoteExtension) + consts.MarkdownExtension
+	return nil
+}
+
+func fillFileURL(inst *instance.Instance, fileID string, msg *RAGIndexMessage) error {
+	doc, err := inst.VFS().FileByID(fileID)
+	if err != nil {
+		return fmt.Errorf("rag: failed to load file %s: %w", fileID, err)
+	}
+	filePath, err := doc.Path(inst.VFS())
+	if err != nil {
+		return fmt.Errorf("rag: failed to resolve path for file %s: %w", fileID, err)
+	}
+	secret, err := vfs.GetStore().AddFileWithTTL(inst, filePath, fileURLTTL)
+	if err != nil {
+		return fmt.Errorf("rag: failed to add file to VFS store: %w", err)
+	}
+	msg.FileURL = inst.PageURL("/files/downloads/"+secret+"/"+url.PathEscape(doc.DocName), nil)
 	return nil
 }
 
@@ -351,6 +364,20 @@ func pushJob(inst *instance.Instance, doctype string) error {
 		Message:    msg,
 	})
 	return err
+}
+
+// cachedWebhookURL returns the RAG webhook URL for the instance, calling
+// EnsureRAGWebhook only on the first invocation per domain.
+func cachedWebhookURL(inst *instance.Instance) (string, error) {
+	if v, ok := webhookURLCache.Load(inst.Domain); ok {
+		return v.(string), nil
+	}
+	u, err := EnsureRAGWebhook(inst)
+	if err != nil {
+		return "", err
+	}
+	webhookURLCache.Store(inst.Domain, u)
+	return u, nil
 }
 
 func CleanInstance(inst *instance.Instance) error {

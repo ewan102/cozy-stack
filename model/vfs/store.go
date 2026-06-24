@@ -19,6 +19,7 @@ import (
 // archive, or a metadata object for an upcoming upload.
 type Store interface {
 	AddFile(db prefixer.Prefixer, filePath string) (string, error)
+	AddFileWithTTL(db prefixer.Prefixer, filePath string, ttl time.Duration) (string, error)
 	AddThumb(db prefixer.Prefixer, fileID string) (string, error)
 	AddThumbs(db prefixer.Prefixer, fileIDs []string) (map[string]string, error)
 	AddVersion(db prefixer.Prefixer, versionID string) (string, error)
@@ -84,12 +85,17 @@ func (s *memStore) cleaner() {
 }
 
 func (s *memStore) AddFile(db prefixer.Prefixer, filePath string) (string, error) {
+	return s.AddFileWithTTL(db, filePath, storeTTL)
+}
+
+// AddFileWithTTL stores filePath behind a fresh secret that expires after ttl.
+func (s *memStore) AddFileWithTTL(db prefixer.Prefixer, filePath string, ttl time.Duration) (string, error) {
 	key := makeSecret()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.vals[db.DBPrefix()+":"+key] = &memRef{
 		val: filePath,
-		exp: time.Now().Add(storeTTL),
+		exp: time.Now().Add(ttl),
 	}
 	return key, nil
 }
@@ -256,8 +262,13 @@ func newRedisStore(cli redis.UniversalClient) Store {
 }
 
 func (s *redisStore) AddFile(db prefixer.Prefixer, filePath string) (string, error) {
+	return s.AddFileWithTTL(db, filePath, storeTTL)
+}
+
+// AddFileWithTTL stores filePath behind a fresh secret that expires after ttl.
+func (s *redisStore) AddFileWithTTL(db prefixer.Prefixer, filePath string, ttl time.Duration) (string, error) {
 	key := makeSecret()
-	if err := s.c.Set(s.ctx, db.DBPrefix()+":"+key, filePath, storeTTL).Err(); err != nil {
+	if err := s.c.Set(s.ctx, db.DBPrefix()+":"+key, filePath, ttl).Err(); err != nil {
 		return "", err
 	}
 	return key, nil

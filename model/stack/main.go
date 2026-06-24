@@ -8,6 +8,7 @@ import (
 	"github.com/cozy/cozy-stack/model/cloudery"
 	"github.com/cozy/cozy-stack/model/instance"
 	"github.com/cozy/cozy-stack/model/job"
+	"github.com/cozy/cozy-stack/model/rag"
 	"github.com/cozy/cozy-stack/model/settings"
 	"github.com/cozy/cozy-stack/model/token"
 	"github.com/cozy/cozy-stack/pkg/assets/dynamic"
@@ -115,6 +116,7 @@ security features. Please do not use this binary as your production server.
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to init the rabbitmq service: %w", err)
 	}
+	rag.Init(ragBroker{svc: rabbitmqSvc})
 
 	services := Services{
 		Emailer:  emailerSvc,
@@ -143,4 +145,18 @@ security features. Please do not use this binary as your production server.
 	processes := utils.NewGroupShutdown(shutdowners...)
 
 	return processes, &services, nil
+}
+
+// ragBroker adapts rabbitmq.Service to the rag.Broker interface, wiring the
+// exchange and routing key for RAG index messages.
+type ragBroker struct{ svc rabbitmq.Service }
+
+func (b ragBroker) Publish(ctx context.Context, contextName string, payload rag.RAGIndexMessage) error {
+	return b.svc.Publish(ctx, rabbitmq.PublishRequest{
+		ContextName: contextName,
+		Exchange:    "rag.index.topic",
+		RoutingKey:  "rag.index.file",
+		Payload:     payload,
+		MessageID:   payload.FileID,
+	})
 }
