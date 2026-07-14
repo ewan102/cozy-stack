@@ -5,6 +5,7 @@ import (
 
 	"github.com/cozy/cozy-stack/model/instance"
 	"github.com/cozy/cozy-stack/model/job"
+	"github.com/cozy/cozy-stack/pkg/couchdb"
 )
 
 // ragStatusTriggerID is the fixed ID of the per-instance @webhook trigger that
@@ -30,9 +31,16 @@ func EnsureRAGWebhook(inst *instance.Instance) (string, error) {
 			return "", err
 		}
 		if err = sched.AddTrigger(t); err != nil {
-			return "", err
+			if !couchdb.IsConflictError(err) {
+				return "", err
+			}
+			// A concurrent first call already created the trigger; reuse it.
+			if t, err = sched.GetTrigger(inst, ragStatusTriggerID); err != nil {
+				return "", err
+			}
+		} else {
+			inst.Logger().WithNamespace("rag").Infof("RAG webhook trigger created: %s", t.ID())
 		}
-		inst.Logger().WithNamespace("rag").Infof("RAG webhook trigger created: %s", t.ID())
 	}
 	return inst.PageURL("/jobs/webhooks/"+t.ID(), nil), nil
 }

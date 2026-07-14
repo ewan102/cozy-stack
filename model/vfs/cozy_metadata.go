@@ -217,19 +217,9 @@ func (fcm *FilesCozyMetadata) ToJSONDoc() map[string]interface{} {
 		doc["trashedBy"] = trashed
 	}
 	if fcm.RAG != nil {
-		rag := map[string]interface{}{
-			"indexed": fcm.RAG.Indexed,
-		}
-		if fcm.RAG.Status != "" {
-			rag["status"] = fcm.RAG.Status
-		}
-		if fcm.RAG.LastSuccessDate != nil {
-			rag["lastSuccessDate"] = *fcm.RAG.LastSuccessDate
-		}
-		if fcm.RAG.LastErrorDate != nil {
-			rag["lastErrorDate"] = *fcm.RAG.LastErrorDate
-		}
-		doc["rag"] = rag
+		// Serialize via the struct's json tags so every field is handled
+		// uniformly (indexed, status, and the dates).
+		doc["rag"] = fcm.RAG
 	}
 	if fcm.SourceAccount != "" {
 		doc["sourceAccount"] = fcm.SourceAccount

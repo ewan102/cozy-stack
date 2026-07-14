@@ -25,7 +25,12 @@ type statusMessage struct {
 	Partition string `json:"partition"`
 	FileID    string `json:"file_id"`
 	Status    string `json:"status"`    // "success" | "error" | "notsupported"
-	Timestamp string `json:"timestamp"` // RFC3339Nano; absent in older emitters
+	Timestamp string `json:"timestamp"` // RFC3339Nano
+	// Metadata is the file metadata carried by the callback. Its "version" field
+	// holds the content md5sum, used to drop callbacks about outdated content.
+	Metadata struct {
+		Version string `json:"version"`
+	} `json:"metadata"`
 }
 
 func WorkerIndexStatus(ctx *job.TaskContext) error {
@@ -68,7 +73,7 @@ func WorkerIndexStatus(ctx *job.TaskContext) error {
 
 	log.Debugf("rag-index-status: file %s status=%s ts=%s", msg.FileID, msg.Status, ts)
 
-	if err := modelrag.SetRAGStatus(inst, msg.FileID, msg.Status, ts); err != nil {
+	if err := modelrag.SetRAGStatus(inst, msg.FileID, msg.Status, msg.Metadata.Version, ts); err != nil {
 		if couchdb.IsNotFoundError(err) {
 			log.Debugf("rag-index-status: file %s not found (possibly deleted), skipping", msg.FileID)
 			return nil
