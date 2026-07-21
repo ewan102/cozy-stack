@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 
@@ -251,6 +252,10 @@ func TestEnsureWorkspaceHTTP(t *testing.T) {
 				w.WriteHeader(http.StatusCreated)
 			case req.Method == http.MethodPost && req.URL.Path == "/partition/dom/workspaces/folder1/files":
 				w.WriteHeader(http.StatusNotFound)
+			case req.Method == http.MethodGet && req.URL.Path == "/partition/dom/workspaces/folder1/files":
+				// deleteWorkspace's list-before-delete: the workspace is
+				// already gone, same as the vanished-workspace scenario.
+				w.WriteHeader(http.StatusNotFound)
 			case req.Method == http.MethodDelete && req.URL.Path == "/partition/dom/workspaces/folder1":
 				// rollback of the failed ensure
 				w.WriteHeader(http.StatusNotFound)
@@ -278,6 +283,10 @@ func TestEnsureWorkspaceHTTP(t *testing.T) {
 				w.WriteHeader(http.StatusCreated)
 			case req.Method == http.MethodPost && req.URL.Path == "/partition/dom/workspaces/folder1/files":
 				w.WriteHeader(http.StatusInternalServerError)
+			case req.Method == http.MethodGet && req.URL.Path == "/partition/dom/workspaces/folder1/files":
+				// deleteWorkspace's list-before-delete: the backfill never
+				// got past its first (failing) chunk, so nothing is attached.
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{"file_ids": []string{}})
 			case req.Method == http.MethodDelete && req.URL.Path == "/partition/dom/workspaces/folder1":
 				w.WriteHeader(http.StatusOK)
 			default:
@@ -327,6 +336,10 @@ func TestEnsureWorkspaceHTTP(t *testing.T) {
 				} else {
 					w.WriteHeader(http.StatusOK)
 				}
+			case req.Method == http.MethodGet && req.URL.Path == "/partition/dom/workspaces/folder1/files":
+				// deleteWorkspace's list-before-delete: the backfill never
+				// got past its first (failing) chunk, so nothing is attached.
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{"file_ids": []string{}})
 			case req.Method == http.MethodDelete && req.URL.Path == "/partition/dom/workspaces/folder1":
 				workspaceExists = false
 				w.WriteHeader(http.StatusOK)
@@ -341,8 +354,155 @@ func TestEnsureWorkspaceHTTP(t *testing.T) {
 
 		assert.Equal(t, 2, rec.countPath("/partition/dom/workspaces"),
 			"the workspace must be re-created by the second ensure")
-		assert.Equal(t, 2, rec.countPath("/partition/dom/workspaces/folder1/files"),
-			"the backfill must rerun after the rollback")
+		var backfillPosts int
+		for _, rr := range rec.all() {
+			if rr.Method == http.MethodPost && rr.Path == "/partition/dom/workspaces/folder1/files" {
+				backfillPosts++
+			}
+		}
+		assert.Equal(t, 2, backfillPosts, "the backfill must rerun after the rollback")
+	})
+}
+
+// --- deleteWorkspace ---------------------------------------------------
+
+func TestDeleteWorkspace(t *testing.T) {
+	t.Run("detaches every file before deleting the now-empty workspace", func(t *testing.T) {
+		var detached []string
+		var mu sync.Mutex
+		server, rec := newRAGTestServer(t, func(w http.ResponseWriter, req *http.Request) {
+			switch {
+			case req.Method == http.MethodGet && req.URL.Path == "/partition/dom/workspaces/folder1/files":
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
+					"file_ids": []string{"file1", "file2"},
+				})
+			case req.Method == http.MethodDelete && strings.HasPrefix(req.URL.Path, "/partition/dom/workspaces/folder1/files/"):
+				mu.Lock()
+				detached = append(detached, strings.TrimPrefix(req.URL.Path, "/partition/dom/workspaces/folder1/files/"))
+				mu.Unlock()
+				w.WriteHeader(http.StatusOK)
+			case req.Method == http.MethodDelete && req.URL.Path == "/partition/dom/workspaces/folder1":
+				w.WriteHeader(http.StatusOK)
+			default:
+				t.Fatalf("unexpected request: %s %s", req.Method, req.URL.Path)
+			}
+		})
+
+		err := deleteWorkspace(server, "dom", "folder1", testLogger())
+		require.NoError(t, err)
+
+		assert.ElementsMatch(t, []string{"file1", "file2"}, detached,
+			"every file must be detached before the workspace itself is deleted")
+		assert.Equal(t, 1, rec.countPath("/partition/dom/workspaces/folder1"),
+			"the workspace delete must happen exactly once, after the detaches")
+
+		// The workspace delete must be the LAST request: detaching happens
+		// strictly before the cascade-risking final delete.
+		all := rec.all()
+		last := all[len(all)-1]
+		assert.Equal(t, http.MethodDelete, last.Method)
+		assert.Equal(t, "/partition/dom/workspaces/folder1", last.Path)
+	})
+
+	t.Run("empty workspace is deleted directly, no detach calls", func(t *testing.T) {
+		server, rec := newRAGTestServer(t, func(w http.ResponseWriter, req *http.Request) {
+			switch {
+			case req.Method == http.MethodGet && req.URL.Path == "/partition/dom/workspaces/folder1/files":
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{"file_ids": []string{}})
+			case req.Method == http.MethodDelete && req.URL.Path == "/partition/dom/workspaces/folder1":
+				w.WriteHeader(http.StatusOK)
+			default:
+				t.Fatalf("unexpected request: %s %s", req.Method, req.URL.Path)
+			}
+		})
+
+		require.NoError(t, deleteWorkspace(server, "dom", "folder1", testLogger()))
+		assert.Len(t, rec.all(), 2, "just the list and the final delete")
+	})
+
+	t.Run("a file that fails to detach prevents the workspace delete (never risk the cascade)", func(t *testing.T) {
+		server, rec := newRAGTestServer(t, func(w http.ResponseWriter, req *http.Request) {
+			switch {
+			case req.Method == http.MethodGet && req.URL.Path == "/partition/dom/workspaces/folder1/files":
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{
+					"file_ids": []string{"file1", "file2"},
+				})
+			case req.Method == http.MethodDelete && req.URL.Path == "/partition/dom/workspaces/folder1/files/file1":
+				w.WriteHeader(http.StatusInternalServerError)
+			case req.Method == http.MethodDelete && req.URL.Path == "/partition/dom/workspaces/folder1/files/file2":
+				w.WriteHeader(http.StatusOK)
+			case req.Method == http.MethodDelete && req.URL.Path == "/partition/dom/workspaces/folder1":
+				t.Fatalf("the workspace must never be deleted when a file failed to detach")
+			default:
+				t.Fatalf("unexpected request: %s %s", req.Method, req.URL.Path)
+			}
+		})
+
+		err := deleteWorkspace(server, "dom", "folder1", testLogger())
+		require.Error(t, err)
+		assert.Zero(t, rec.countPath("/partition/dom/workspaces/folder1"))
+	})
+
+	t.Run("list failure prevents the workspace delete", func(t *testing.T) {
+		server, rec := newRAGTestServer(t, func(w http.ResponseWriter, req *http.Request) {
+			switch {
+			case req.Method == http.MethodGet && req.URL.Path == "/partition/dom/workspaces/folder1/files":
+				w.WriteHeader(http.StatusInternalServerError)
+			default:
+				t.Fatalf("unexpected request: %s %s", req.Method, req.URL.Path)
+			}
+		})
+
+		err := deleteWorkspace(server, "dom", "folder1", testLogger())
+		require.Error(t, err)
+		assert.Len(t, rec.all(), 1, "only the failed list call, nothing else")
+	})
+
+	t.Run("workspace already gone (404 on both list and final delete) is a no-op success", func(t *testing.T) {
+		server, rec := newRAGTestServer(t, func(w http.ResponseWriter, req *http.Request) {
+			switch {
+			case req.Method == http.MethodGet && req.URL.Path == "/partition/dom/workspaces/folder1/files":
+				w.WriteHeader(http.StatusNotFound)
+			case req.Method == http.MethodDelete && req.URL.Path == "/partition/dom/workspaces/folder1":
+				// Nothing to detach, so deleteWorkspace still attempts the
+				// final delete; a 404 there is tolerated too.
+				w.WriteHeader(http.StatusNotFound)
+			default:
+				t.Fatalf("unexpected request: %s %s", req.Method, req.URL.Path)
+			}
+		})
+
+		require.NoError(t, deleteWorkspace(server, "dom", "folder1", testLogger()))
+		assert.Len(t, rec.all(), 2, "the list (404) and the final delete (404, tolerated)")
+	})
+}
+
+// --- AssistantDeleted / assistantDirIDFromEvent -----------------------------
+
+func TestAssistantDirIDFromEvent(t *testing.T) {
+	t.Run("extracts the dirId of a deleted assistant with a knowledge base", func(t *testing.T) {
+		event := json.RawMessage(`{
+			"verb": "DELETED",
+			"doc": {
+				"_id": "assistant1",
+				"knowledgeBase": [{"doctype": "io.cozy.files", "dirId": "folder1"}]
+			}
+		}`)
+		dirID, err := assistantDirIDFromEvent(event, testLogger())
+		require.NoError(t, err)
+		assert.Equal(t, "folder1", dirID)
+	})
+
+	t.Run("an assistant with no knowledge base yields an empty dirID", func(t *testing.T) {
+		event := json.RawMessage(`{"verb": "DELETED", "doc": {"_id": "assistant1"}}`)
+		dirID, err := assistantDirIDFromEvent(event, testLogger())
+		require.NoError(t, err)
+		assert.Equal(t, "", dirID)
+	})
+
+	t.Run("malformed event payload returns an error", func(t *testing.T) {
+		_, err := assistantDirIDFromEvent(json.RawMessage(`not json`), testLogger())
+		require.Error(t, err)
 	})
 }
 

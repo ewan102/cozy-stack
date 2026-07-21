@@ -420,6 +420,13 @@ func Query(inst *instance.Instance, logger logger.Logger, query QueryMessage) er
 			return err
 		}
 		metadata["workspace"] = dirID
+		// Best-effort: only a folder-scoped assistant ever creates a
+		// workspace that needs cleaning up on deletion, so this is ensured
+		// right alongside the workspace itself, not for every assistant.
+		// Failing to (re-)provision it must never block the query.
+		if err := ensureAssistantDeletionTrigger(inst); err != nil {
+			logger.Warnf("cannot ensure assistant-deletion trigger: %s", err)
+		}
 	}
 	payload := map[string]interface{}{
 		"model":       fmt.Sprintf("ragondin-%s", inst.Domain),

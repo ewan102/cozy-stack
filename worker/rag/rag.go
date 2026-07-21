@@ -1,6 +1,7 @@
 package rag
 
 import (
+	"encoding/json"
 	"runtime"
 	"time"
 
@@ -26,6 +27,15 @@ func init() {
 		Timeout:      15 * time.Minute,
 		WorkerFunc:   WorkerQuery,
 	})
+
+	job.AddWorker(&job.WorkerConfig{
+		WorkerType:   "rag-workspace-clean",
+		Concurrency:  runtime.NumCPU(),
+		MaxExecCount: 3,
+		Reserved:     true,
+		Timeout:      1 * time.Minute,
+		WorkerFunc:   WorkerCleanWorkspace,
+	})
 }
 
 func WorkerIndex(ctx *job.TaskContext) error {
@@ -46,4 +56,20 @@ func WorkerQuery(ctx *job.TaskContext) error {
 	}
 	logger.Debugf("RAG: query %v", msg)
 	return rag.Query(ctx.Instance, logger, msg)
+}
+
+// WorkerCleanWorkspace handles the @event trigger on the deletion of an
+// io.cozy.ai.chat.assistants document (see docs/ai.md for the trigger
+// setup). The event's payload carries the deleted assistant's last known
+// content, including its knowledgeBase folder, if any -- interpreting it
+// requires model/rag's own (unexported) assistant types, so the raw event
+// is passed through as-is rather than re-parsed here.
+func WorkerCleanWorkspace(ctx *job.TaskContext) error {
+	logger := ctx.Logger()
+	var raw json.RawMessage
+	if err := ctx.UnmarshalEvent(&raw); err != nil {
+		return err
+	}
+	logger.Debugf("RAG: cleaning up the workspace of a deleted assistant, if any")
+	return rag.AssistantDeleted(ctx.Instance, logger, raw)
 }

@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/cozy/cozy-stack/model/instance"
+	"github.com/cozy/cozy-stack/model/job"
 	"github.com/cozy/cozy-stack/model/vfs"
 	"github.com/cozy/cozy-stack/pkg/config/config"
 	"github.com/cozy/cozy-stack/pkg/consts"
@@ -356,26 +357,178 @@ func ensureWorkspaceHTTP(server config.RAGServer, domain, dirID string, resolve 
 			// The workspace was just created but is incomplete, and a later
 			// ensureWorkspace call would see it exists (GET 200) and never
 			// retry the backfill: delete it so the next call starts over.
-			deleteWorkspace(server, domain, dirID, logger)
+			// Best-effort: a failure here is only logged (by deleteWorkspace
+			// itself), not joined into the returned error, which must stay
+			// the original backfill failure.
+			_ = deleteWorkspace(server, domain, dirID, logger)
 			return err
 		}
 	}
 	return nil
 }
 
-// deleteWorkspace best-effort deletes a workspace whose membership backfill
-// failed. If the deletion itself fails, the workspace stays incomplete until
-// an operator or a future ensure path cleans it up: log loudly.
-func deleteWorkspace(server config.RAGServer, domain, dirID string, logger logger.Logger) {
-	res, err := callRAG(server, http.MethodDelete, nil, fmt.Sprintf("/partition/%s/workspaces/%s", domain, url.PathEscape(dirID)), echo.MIMEApplicationJSON)
+// listWorkspaceFiles returns the ids of the files currently attached to a
+// workspace on openRAG.
+func listWorkspaceFiles(server config.RAGServer, domain, dirID string) ([]string, error) {
+	res, err := callRAG(server, http.MethodGet, nil, fmt.Sprintf("/partition/%s/workspaces/%s/files", domain, url.PathEscape(dirID)), echo.MIMEApplicationJSON)
 	if err != nil {
-		logger.Errorf("cannot rollback incomplete RAG workspace %s: %s", dirID, err)
-		return
+		return nil, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode == http.StatusNotFound {
+		return nil, nil // already gone: nothing to list
+	}
+	if res.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("list workspace files status code: %d", res.StatusCode)
+	}
+	var body struct {
+		FileIDs []string `json:"file_ids"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+		return nil, err
+	}
+	return body.FileIDs, nil
+}
+
+// removeFileFromWorkspace detaches a single file from a workspace. Unlike
+// deleting the workspace itself, this never cascades into deleting the
+// file's index entry (confirmed against openRAG's own source,
+// services/orchestrators/workspace_service.py: remove_file is a plain
+// association removal, with no orphan-cleanup logic attached): the file
+// stays indexed and searchable by any other workspace or unscoped query.
+func removeFileFromWorkspace(server config.RAGServer, domain, dirID, fileID string, logger logger.Logger) error {
+	res, err := callRAG(server, http.MethodDelete, nil, fmt.Sprintf("/partition/%s/workspaces/%s/files/%s", domain, url.PathEscape(dirID), url.PathEscape(fileID)), echo.MIMEApplicationJSON)
+	if err != nil {
+		logger.Warnf("cannot detach file %s from workspace %s: %s", fileID, dirID, err)
+		return err
 	}
 	res.Body.Close()
 	if res.StatusCode >= 300 && res.StatusCode != http.StatusNotFound {
-		logger.Errorf("cannot rollback incomplete RAG workspace %s: status code %d", dirID, res.StatusCode)
+		logger.Warnf("cannot detach file %s from workspace %s: status code %d", fileID, dirID, res.StatusCode)
+		return fmt.Errorf("detach status code: %d", res.StatusCode)
 	}
+	return nil
+}
+
+// deleteWorkspace safely removes a workspace from openRAG, whether it is an
+// incomplete workspace being rolled back (failed backfill) or a workspace
+// whose owning assistant was deleted.
+//
+// openRAG's own DELETE /partition/:domain/workspaces/:id cascades: any file
+// left in the workspace that belongs to no OTHER workspace is permanently
+// deleted from the partition's index, not just detached from this one
+// (verified against openRAG's own source: WorkspaceService.delete_workspace
+// "fully deletes any files it orphaned" from the vector store and catalog).
+// A workspace scoping a knowledge-base folder is, in the common case
+// (no folder nesting/sharing between assistants), the ONLY workspace its
+// files belong to -- so calling that endpoint directly on a non-empty
+// workspace would desindex those files for every other assistant and every
+// unscoped query, not just remove them from this grouping.
+//
+// To delete a workspace without that collateral damage, every file is first
+// detached individually via removeFileFromWorkspace (confirmed to never
+// cascade), so the workspace is genuinely empty by the time it is deleted
+// and openRAG's orphan-cleanup pass has nothing left to act on.
+//
+// If any file fails to detach, the workspace is deliberately left
+// undeleted and non-empty rather than risking the cascade on a workspace
+// that might still hold files: the caller must be able to retry later.
+func deleteWorkspace(server config.RAGServer, domain, dirID string, logger logger.Logger) error {
+	fileIDs, err := listWorkspaceFiles(server, domain, dirID)
+	if err != nil {
+		logger.Errorf("cannot list files of RAG workspace %s, not deleting it: %s", dirID, err)
+		return err
+	}
+	var failed int
+	for _, fileID := range fileIDs {
+		if err := removeFileFromWorkspace(server, domain, dirID, fileID, logger); err != nil {
+			failed++
+		}
+	}
+	if failed > 0 {
+		err := fmt.Errorf("%d file(s) could not be detached from workspace %s", failed, dirID)
+		logger.Errorf("cannot delete RAG workspace %s: %s (workspace left non-empty to avoid a cascading delete of the remaining files)", dirID, err)
+		return err
+	}
+	res, err := callRAG(server, http.MethodDelete, nil, fmt.Sprintf("/partition/%s/workspaces/%s", domain, url.PathEscape(dirID)), echo.MIMEApplicationJSON)
+	if err != nil {
+		logger.Errorf("cannot delete RAG workspace %s: %s", dirID, err)
+		return err
+	}
+	res.Body.Close()
+	if res.StatusCode >= 300 && res.StatusCode != http.StatusNotFound {
+		err := fmt.Errorf("delete workspace status code: %d", res.StatusCode)
+		logger.Errorf("cannot delete RAG workspace %s: %s", dirID, err)
+		return err
+	}
+	return nil
+}
+
+// AssistantDeleted handles the @event trigger fired when an
+// io.cozy.ai.chat.assistants document is deleted (see docs/ai.md for the
+// trigger setup). If the deleted assistant declared a knowledge-base
+// folder, no live assistant references its openRAG workspace anymore: it is
+// safely deleted via deleteWorkspace (list-then-detach-then-delete, never a
+// direct cascade). event is the raw JSON payload of the realtime.Event
+// carrying the deleted document (its "doc" field).
+//
+// Deliberately out of scope: reconfiguring an assistant to a different
+// folder (an UPDATE, not a DELETE) leaves its previous workspace orphaned
+// exactly the same way, but is not handled here -- a product decision, not
+// an oversight.
+func AssistantDeleted(inst *instance.Instance, logger logger.Logger, event json.RawMessage) error {
+	dirID, err := assistantDirIDFromEvent(event, logger)
+	if err != nil {
+		return err
+	}
+	if dirID == "" {
+		return nil
+	}
+	return deleteWorkspace(inst.RAGServer(), inst.Domain, dirID, logger)
+}
+
+// assistantDirIDFromEvent extracts the knowledge-base dirID from the raw
+// @event trigger payload of a deleted assistant ("" if it had none). Split
+// out from AssistantDeleted so the parsing can be unit-tested without an
+// *instance.Instance.
+func assistantDirIDFromEvent(event json.RawMessage, logger logger.Logger) (string, error) {
+	var evt struct {
+		Doc chatAssistant `json:"doc"`
+	}
+	if err := json.Unmarshal(event, &evt); err != nil {
+		return "", err
+	}
+	return knowledgeBaseDirID(&evt.Doc, logger), nil
+}
+
+// assistantDeletionTriggerInfos is the @event scope for
+// io.cozy.ai.chat.assistants deletions, matching the pattern already used
+// for e.g. cozy-to-cozy sharing triggers (model/sharing/rule.go's
+// TriggerArgs: "doctype:VERB1,VERB2"). "DELETED" is realtime.EventDelete's
+// exact string form, required for the trigger's rule matching to fire (see
+// model/job/trigger_event.go's eventMatchRule).
+var assistantDeletionTriggerInfos = job.TriggerInfos{
+	Type:       "@event",
+	WorkerType: "rag-workspace-clean",
+	Arguments:  consts.ChatAssistants + ":DELETED",
+}
+
+// ensureAssistantDeletionTrigger makes sure the instance has an @event
+// trigger wired to AssistantDeleted via the rag-workspace-clean worker.
+// Idempotent (checked via HasTrigger) and cheap, so it can be called
+// lazily -- from Chat(), the first time a conversation is linked to an
+// assistant -- rather than requiring a manual per-instance setup step like
+// the existing rag-index trigger (see docs/ai.md).
+func ensureAssistantDeletionTrigger(inst *instance.Instance) error {
+	sched := job.System()
+	if sched.HasTrigger(inst, assistantDeletionTriggerInfos) {
+		return nil
+	}
+	t, err := job.NewTrigger(inst, assistantDeletionTriggerInfos, nil)
+	if err != nil {
+		return err
+	}
+	return sched.AddTrigger(t)
 }
 
 // workspaceExists tells whether the workspace exists on the openRAG server.
