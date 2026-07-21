@@ -57,6 +57,9 @@ type FilesCozyMetadata struct {
 	TrashedBy *TrashedByEntry `json:"trashedBy,omitempty"`
 	// RAG indexation status
 	RAG *RAGMetadata `json:"rag,omitempty"`
+	// AuthorizedIndex authorizes this file/folder (and everything under a
+	// flagged folder) to be indexed by RAG.
+	AuthorizedIndex bool `json:"authorized_index"`
 }
 
 // NewCozyMetadata initializes a new FilesCozyMetadata struct
@@ -221,6 +224,7 @@ func (fcm *FilesCozyMetadata) ToJSONDoc() map[string]interface{} {
 		// uniformly (indexed, status, and the dates).
 		doc["rag"] = fcm.RAG
 	}
+	doc["authorized_index"] = fcm.AuthorizedIndex
 	if fcm.SourceAccount != "" {
 		doc["sourceAccount"] = fcm.SourceAccount
 	}

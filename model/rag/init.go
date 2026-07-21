@@ -33,3 +33,12 @@ func Init(b Broker) {
 // The webhook URL is stable for the lifetime of the trigger, so caching it
 // avoids one CouchDB round-trip per file in every indexing batch.
 var webhookURLCache sync.Map // map[domain string]string
+
+// authorizedIndexCache tracks the last known AuthorizedIndex flag seen for
+// each folder ID, so callRAGIndexer can skip the (potentially expensive)
+// subtree fan-out when a folder document changes for a reason unrelated to
+// that flag (e.g. a rename). Process-wide and in-memory: a cold cache (after
+// a restart, or the first time a folder is seen) always triggers one fan-out,
+// which self-corrects the cache and is harmless since it either finds
+// nothing to do or brings RAG back in sync.
+var authorizedIndexCache sync.Map // map["domain/dirID" string]bool

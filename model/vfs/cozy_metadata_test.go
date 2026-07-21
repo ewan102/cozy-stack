@@ -118,4 +118,10 @@ func TestFilesCozyMetadataCloneAndToJSONDoc(t *testing.T) {
 		assert.Equal(t, "Alice", trashedBy["displayName"])
 		assert.Equal(t, "alice.cozy.localhost", trashedBy["domain"])
 	}
+	assert.Equal(t, false, doc["authorized_index"])
+
+	fcm.AuthorizedIndex = true
+	cloned = fcm.Clone()
+	assert.True(t, cloned.AuthorizedIndex)
+	assert.Equal(t, true, fcm.ToJSONDoc()["authorized_index"])
 }
