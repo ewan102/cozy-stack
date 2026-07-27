@@ -23,6 +23,11 @@ func Chat(c echo.Context) error {
 	}
 	payload.ChatConversationID = c.Param("id")
 	inst := middlewares.GetInstance(c)
+	if len(payload.AttachmentIDs) > 0 || payload.AssistantID != "" {
+		if err := middlewares.AllowWholeType(c, permission.GET, consts.Files); err != nil {
+			return middlewares.ErrForbidden
+		}
+	}
 	chat, err := rag.Chat(inst, payload)
 	if err != nil {
 		return jsonapi.InternalServerError(err)
