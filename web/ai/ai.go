@@ -75,4 +75,5 @@ func Routes(router *echo.Group) {
 	router.POST("/chat/conversations/:id", Chat)
 	router.POST("/v1/chat/completions", OpenAICompletion)
 	router.POST("/v1/tools/execute", ExecuteTool)
+	router.POST("/index/status", IndexStatus)
 }

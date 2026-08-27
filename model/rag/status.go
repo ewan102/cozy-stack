@@ -17,6 +17,12 @@ const (
 	RAGStatusNotSupported = "notsupported"
 )
 
+// IndexStatusPath is the path of the route on which the RAG indexer posts the
+// indexation status of a file. It is the single source of truth for that path:
+// web/ai declares its route from it, and it is what must be given to
+// inst.PageURL to build the callback_url sent to the indexer.
+const IndexStatusPath = "/ai/index/status"
+
 func SetRAGStatus(inst *instance.Instance, fileID, newStatus, md5sum string, timestamp time.Time) error {
 	if timestamp.IsZero() {
 		timestamp = time.Now()
@@ -67,8 +73,8 @@ func SetRAGStatus(inst *instance.Instance, fileID, newStatus, md5sum string, tim
 		return err
 	}
 
-	// Retry once on conflict; the worker's automatic retry covers a rare second
-	// conflict, so no loop is needed here.
+	// Retry once on conflict. A second conflict is surfaced to the caller, and
+	// thus answered with a 500 on the callback route.
 	file, ok, err = fetch()
 	if err != nil || !ok {
 		return err
