@@ -18,9 +18,8 @@ const (
 )
 
 // IndexStatusPath is the path of the route on which the RAG indexer posts the
-// indexation status of a file. It is the single source of truth for that path:
-// web/ai declares its route from it, and it is what must be given to
-// inst.PageURL to build the callback_url sent to the indexer.
+// indexation status of a file. It is what inst.PageURL takes to build the
+// callback_url given to the indexer.
 const IndexStatusPath = "/ai/index/status"
 
 func SetRAGStatus(inst *instance.Instance, fileID, newStatus, md5sum string, timestamp time.Time) error {

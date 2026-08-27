@@ -19,7 +19,7 @@ type statusMessage struct {
 	FileID    string `json:"file_id"`
 	Status    string `json:"status"`    // "success" | "error" | "notsupported"
 	Timestamp string `json:"timestamp"` // RFC3339Nano
-	// Its "version" field holds the content md5sum, used to drop callbacks
+	// The "version" field holds the content md5sum, used to drop callbacks
 	// about outdated content.
 	Metadata struct {
 		Version string `json:"version"`
@@ -27,7 +27,7 @@ type statusMessage struct {
 }
 
 // IndexStatus is the callback route used by the RAG indexer to report the
-// indexation status of a file. It is not authenticated yet.
+// indexation status of a file. This route has no authentication.
 //
 // A malformed payload is answered with a 400: the indexer must not replay it.
 // A failure on our side is answered with a 500, so that it can be replayed.
