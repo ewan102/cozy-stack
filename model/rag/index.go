@@ -2,6 +2,8 @@ package rag
 
 import (
 	"bytes"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +13,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/cozy/cozy-stack/model/feature"
 	"github.com/cozy/cozy-stack/model/instance"
@@ -80,30 +83,7 @@ func callRAGIndexer(inst *instance.Instance, doctype string, change couchdb.Chan
 	if strings.HasPrefix(change.DocID, "_design/") {
 		return nil
 	}
-	flags, err := feature.GetFlags(inst)
-	class, _ := change.Doc.Get("class").(string)
 
-	if class == consts.ImageClass {
-		// Index images only if flag allows it
-		allowImage, ok := flags.M["rag.index.image.enabled"].(bool)
-		if !ok || !allowImage {
-			return nil
-		}
-	}
-	if class == consts.VideoClass {
-		// Index videos only if flag allows it
-		allowVideo, ok := flags.M["rag.index.video.enabled"].(bool)
-		if !ok || !allowVideo {
-			return nil
-		}
-	}
-	if class == consts.AudioClass {
-		// Index audio only if flag allows it
-		allowAudio, ok := flags.M["rag.index.audio.enabled"].(bool)
-		if !ok || !allowAudio {
-			return nil
-		}
-	}
 	if change.Doc.Get("type") == consts.DirType {
 		// A directory move or rename rewrites the path of the directory and
 		// of all its descendant directories, but never touches the file docs
@@ -118,215 +98,347 @@ func callRAGIndexer(inst *instance.Instance, doctype string, change couchdb.Chan
 		return nil
 	}
 
-	ragServer := inst.RAGServer()
-	if ragServer.URL == "" {
+	// An error only means some sources were unreachable, the flags are usable.
+	flags, _ := feature.GetFlags(inst)
+	if inst.RAGServer().URL == "" {
 		return errors.New("no RAG server configured")
 	}
-	u, err := url.Parse(ragServer.URL)
+
+	class, _ := change.Doc.Get("class").(string)
+	if !isClassAllowed(flags, class) {
+		return markNotSupported(inst, change)
+	}
+
+	if change.Deleted || change.Doc.Get("trashed") == true {
+		return deleteFromRAG(inst, change.DocID)
+	}
+	return upsertToRAG(inst, doctype, change, kb, logger)
+}
+
+func isClassAllowed(flags *feature.Flags, class string) bool {
+	switch class {
+	case consts.ImageClass:
+		allowed, _ := flags.M["rag.index.image.enabled"].(bool)
+		return allowed
+	case consts.VideoClass:
+		allowed, _ := flags.M["rag.index.video.enabled"].(bool)
+		return allowed
+	case consts.AudioClass:
+		allowed, _ := flags.M["rag.index.audio.enabled"].(bool)
+		return allowed
+	}
+	return true
+}
+
+// markNotSupported records a status no emitter ever reports: it is the stack
+// that decides a file will not be indexed.
+func markNotSupported(inst *instance.Instance, change couchdb.Change) error {
+	rev, _ := change.Doc.Get("_rev").(string)
+	return SetIndexStatus(inst, change.DocID, StatusNotSupported, rev, time.Now())
+}
+
+func deleteFromRAG(inst *instance.Instance, fileID string) error {
+	if err := deleteFromRAGHTTP(inst.RAGServer(), inst.Domain, fileID); err != nil {
+		return err
+	}
+	return DeleteIndexStatus(inst, fileID)
+}
+
+func deleteFromRAGHTTP(server config.RAGServer, domain, fileID string) error {
+	path := fmt.Sprintf("/indexer/partition/%s/file/%s", domain, url.PathEscape(fileID))
+	res, err := callRAG(server, http.MethodDelete, nil, path, echo.MIMEApplicationJSON)
 	if err != nil {
 		return err
 	}
-	if change.Deleted || change.Doc.Get("trashed") == true {
-		// Doc deletion
-		res, err := CallRAGQuery(inst, http.MethodDelete, nil, fmt.Sprintf("/indexer/partition/%s/file/%s", inst.Domain, url.PathEscape(change.DocID)), echo.MIMEApplicationJSON)
-		if err != nil {
-			return err
-		}
-		defer res.Body.Close()
-		if res.StatusCode >= 500 {
-			return fmt.Errorf("DELETE status code: %d", res.StatusCode)
-		}
-	} else {
-		md5sum := fmt.Sprintf("%x", change.Doc.Get("md5sum"))
-		res, err := CallRAGQuery(inst, http.MethodGet, nil, fmt.Sprintf("/partition/%s/file/%s", inst.Domain, url.PathEscape(change.DocID)), echo.MIMEApplicationJSON)
-		if err != nil {
-			return err
-		}
-		defer res.Body.Close()
-
-		// When the content has not changed, there is no need to regenerate
-		// an embedding.
-		needIndexation := false
-		isNewFile := false
-		switch res.StatusCode {
-		case 200:
-			var response map[string]interface{}
-			if err = json.NewDecoder(res.Body).Decode(&response); err != nil {
-				return err
-			}
-			metadata, ok := response["metadata"].(map[string]interface{})
-			if !ok {
-				needIndexation = true
-			}
-			md5sumFromRAG, ok := metadata["md5sum"].(string)
-			if !ok {
-				needIndexation = true
-			}
-			needIndexation = md5sumFromRAG != md5sum
-
-		case 404:
-			needIndexation = true
-			isNewFile = true
-		default:
-			return fmt.Errorf("GET status code: %d", res.StatusCode)
-		}
-		dirID, _ := change.Doc.Get("dir_id").(string)
-		if !needIndexation {
-			// The content did not change but the file may have been
-			// moved/renamed: keep the knowledge-base workspaces in sync.
-			reconcileMembership(inst, logger, kb(), change.DocID, dirID)
-			return nil
-		}
-
-		name, _ := change.Doc.Get("name").(string)
-		mime, _ := change.Doc.Get("mime").(string)
-		metadataRaw, ok := change.Doc.Get("metadata").(map[string]interface{})
-		datetime := ""
-		if ok {
-			datetime, _ = metadataRaw["datetime"].(string)
-		}
-		internalID, _ := change.Doc.Get("internal_vfs_id").(string)
-		var content io.Reader
-
-		if mime == consts.NoteMimeType {
-			metadata, _ := change.Doc.Get("metadata").(map[string]interface{})
-			schema, _ := metadata["schema"].(map[string]interface{})
-			raw, _ := metadata["content"].(map[string]interface{})
-			noteDoc := &note.Document{
-				DocID:      change.DocID,
-				SchemaSpec: schema,
-				RawContent: raw,
-			}
-			md, err := noteDoc.Markdown(nil)
-			if err != nil {
-				return err
-			}
-			content = bytes.NewReader(md)
-			// See https://github.com/OpenLLM-France/RAGondin/issues/88
-			name = strings.TrimSuffix(name, consts.NoteExtension) + consts.MarkdownExtension
-		} else {
-			fs := inst.VFS()
-			fileDoc := &vfs.FileDoc{
-				Type:       consts.FileType,
-				DocID:      change.DocID,
-				DirID:      dirID,
-				DocName:    name,
-				InternalID: internalID,
-			}
-			f, err := fs.OpenFile(fileDoc)
-			if err != nil {
-				return err
-			}
-			defer f.Close()
-			content = f
-			if strings.HasSuffix(name, consts.DocsExtension) {
-				// See https://github.com/OpenLLM-France/RAGondin/issues/88
-				name = strings.TrimSuffix(name, consts.DocsExtension) + consts.MarkdownExtension
-			}
-		}
-
-		u.RawQuery = url.Values{
-			"dir_id": []string{dirID},
-			"name":   []string{name},
-			"md5sum": []string{md5sum},
-		}.Encode()
-		u.Path = fmt.Sprintf("/indexer/partition/%s/file/%s", inst.Domain, change.DocID)
-
-		// The streaming goroutine below needs the workspace membership, but
-		// kbContext is not safe for concurrent use: resolve it here, on the
-		// indexing loop, before the goroutine starts.
-		var workspaceIDsJSON string
-		attachUnknown := false
-		if kbc := kb(); !kbc.empty() {
-			if desired, ok := kbc.desiredFor(inst, dirID); !ok {
-				logger.Warnf("cannot resolve parent path for file %s (dir %s): skipping workspace attach", change.DocID, dirID)
-				attachUnknown = true
-			} else if len(desired) > 0 {
-				if wsJSON, err := json.Marshal(desired); err == nil {
-					workspaceIDsJSON = string(wsJSON)
-				}
-			}
-		}
-
-		// Create pipe and writer for file streaming
-		pr, pw := io.Pipe()
-		writer := multipart.NewWriter(pw)
-
-		go func() {
-			part, err := writer.CreateFormFile("file", name)
-			if err != nil {
-				_ = pw.CloseWithError(err)
-				return
-			}
-			if _, err := io.Copy(part, content); err != nil {
-				_ = pw.CloseWithError(err)
-				return
-			}
-
-			// No need to add filename here, it is already set through the file form
-			meta := map[string]string{
-				"md5sum":   md5sum,
-				"datetime": datetime,
-				"doctype":  doctype,
-			}
-			ragMetadata, err := json.Marshal(meta)
-			if err != nil {
-				_ = pw.CloseWithError(err)
-				return
-			}
-			if err := writer.WriteField("metadata", string(ragMetadata)); err != nil {
-				_ = pw.CloseWithError(err)
-				return
-			}
-			if workspaceIDsJSON != "" {
-				if err := writer.WriteField("workspace_ids", workspaceIDsJSON); err != nil {
-					_ = pw.CloseWithError(err)
-					return
-				}
-			}
-			defer pw.Close()
-			defer writer.Close()
-		}()
-
-		var req *http.Request
-		if isNewFile {
-			req, err = http.NewRequest(http.MethodPost, u.String(), pr)
-		} else {
-			req, err = http.NewRequest(http.MethodPut, u.String(), pr)
-		}
-		if err != nil {
-			return err
-		}
-
-		req.Header.Add(echo.HeaderAuthorization, "Bearer "+ragServer.APIKey)
-		req.Header.Add("Content-Type", writer.FormDataContentType())
-
-		res, err = ragHTTPClient.Do(req)
-		if err != nil {
-			return err
-		}
-
-		var response map[string]interface{}
-		if err := json.NewDecoder(res.Body).Decode(&response); err != nil {
-			return err
-		}
-		defer res.Body.Close()
-
-		if res.StatusCode >= 500 {
-			return fmt.Errorf("Status code: %d", res.StatusCode)
-		}
-
-		if (!isNewFile || attachUnknown) && res.StatusCode < 300 {
-			// For an existing file, the content changed but it may also have
-			// been moved/renamed at the same time: keep the knowledge-base
-			// workspaces in sync after a successful re-upload. For a new file
-			// whose membership could not be resolved before the upload
-			// (attachUnknown), this is the only chance to attach it: retry
-			// now that the transient path-resolution error may have cleared.
-			reconcileMembership(inst, logger, kb(), change.DocID, dirID)
-		}
+	defer res.Body.Close()
+	if res.StatusCode >= 500 {
+		return fmt.Errorf("DELETE status code: %d", res.StatusCode)
 	}
 	return nil
+}
+
+// needsIndexation reports whether the file must be sent again. isNew tells
+// whether the RAG server knows it at all, which decides between a POST and a PUT.
+func needsIndexation(inst *instance.Instance, fileID, md5sum string) (needed, isNew bool, err error) {
+	indexed, known, err := indexedMD5Sum(inst.RAGServer(), inst.Domain, fileID)
+	if err != nil {
+		return false, false, err
+	}
+	if !known {
+		return true, true, nil
+	}
+	if indexed != md5sum {
+		return true, false, nil
+	}
+	// The RAG server holds this content, but a callback may never have come
+	// back to say so.
+	return !isIndexed(inst, fileID), false, nil
+}
+
+// indexedMD5Sum returns the md5sum the RAG server holds for the file. known is
+// false when it does not know the file at all, which decides between a POST
+// and a PUT.
+func indexedMD5Sum(server config.RAGServer, domain, fileID string) (md5sum string, known bool, err error) {
+	path := fmt.Sprintf("/partition/%s/file/%s", domain, url.PathEscape(fileID))
+	res, err := callRAG(server, http.MethodGet, nil, path, echo.MIMEApplicationJSON)
+	if err != nil {
+		return "", false, err
+	}
+	defer res.Body.Close()
+
+	switch res.StatusCode {
+	case http.StatusOK:
+		var response map[string]interface{}
+		if err := json.NewDecoder(res.Body).Decode(&response); err != nil {
+			return "", false, err
+		}
+		metadata, _ := response["metadata"].(map[string]interface{})
+		md5sum, _ = metadata["md5sum"].(string)
+		return md5sum, true, nil
+	case http.StatusNotFound:
+		return "", false, nil
+	default:
+		return "", false, fmt.Errorf("GET status code: %d", res.StatusCode)
+	}
+}
+
+func isIndexed(inst *instance.Instance, docID string) bool {
+	var doc IndexStatus
+	if err := couchdb.GetDoc(inst, consts.ChatRAG, docID, &doc); err != nil {
+		return false
+	}
+	return doc.Indexed
+}
+
+func upsertToRAG(inst *instance.Instance, doctype string, change couchdb.Change, kb func() *kbContext, logger logger.Logger) error {
+	md5sum := decodeMD5Sum(change.Doc.Get("md5sum"))
+	needed, isNewFile, err := needsIndexation(inst, change.DocID, md5sum)
+	if err != nil {
+		return err
+	}
+
+	dirID, _ := change.Doc.Get("dir_id").(string)
+	if !needed {
+		// The content did not change but the file may have been
+		// moved/renamed: keep the knowledge-base workspaces in sync.
+		reconcileMembership(inst, logger, kb(), change.DocID, dirID)
+		return nil
+	}
+
+	name, content, err := resolveContent(inst, change)
+	if err != nil {
+		return err
+	}
+	defer content.Close()
+
+	// The streaming goroutine below needs the workspace membership, but
+	// kbContext is not safe for concurrent use: resolve it here, on the
+	// indexing loop, before the goroutine starts.
+	workspaceIDsJSON, attachUnknown := resolveWorkspaces(inst, logger, kb(), change.DocID, dirID)
+
+	datetime := ""
+	if metadata, ok := change.Doc.Get("metadata").(map[string]interface{}); ok {
+		datetime, _ = metadata["datetime"].(string)
+	}
+	rev, _ := change.Doc.Get("_rev").(string)
+	meta := map[string]string{
+		"md5sum":   md5sum,
+		"datetime": datetime,
+		"doctype":  doctype,
+		// Echoed back by the indexer on the callback, which is ordered on it.
+		"doc_rev": rev,
+	}
+
+	res, err := uploadToRAG(ragUpload{
+		Server:      inst.RAGServer(),
+		Domain:      inst.Domain,
+		FileID:      change.DocID,
+		Name:        name,
+		DirID:       dirID,
+		MD5Sum:      md5sum,
+		Meta:        meta,
+		Workspaces:  workspaceIDsJSON,
+		CallbackURL: inst.PageURL(IndexStatusPath, nil),
+		IsNew:       isNewFile,
+	}, content)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	if res.StatusCode >= 500 {
+		return fmt.Errorf("Status code: %d", res.StatusCode)
+	}
+
+	if (!isNewFile || attachUnknown) && res.StatusCode < 300 {
+		// For an existing file, the content changed but it may also have
+		// been moved/renamed at the same time: keep the knowledge-base
+		// workspaces in sync after a successful re-upload. For a new file
+		// whose membership could not be resolved before the upload
+		// (attachUnknown), this is the only chance to attach it: retry
+		// now that the transient path-resolution error may have cleared.
+		reconcileMembership(inst, logger, kb(), change.DocID, dirID)
+	}
+	return nil
+}
+
+// resolveWorkspaces returns the knowledge-base workspaces the file belongs to.
+// The boolean tells that they could not be resolved, which is not the same as
+// belonging to none.
+func resolveWorkspaces(inst *instance.Instance, logger logger.Logger, kbc *kbContext, fileID, dirID string) (string, bool) {
+	if kbc.empty() {
+		return "", false
+	}
+	desired, ok := kbc.desiredFor(inst, dirID)
+	if !ok {
+		logger.Warnf("cannot resolve parent path for file %s (dir %s): skipping workspace attach", fileID, dirID)
+		return "", true
+	}
+	if len(desired) == 0 {
+		return "", false
+	}
+	wsJSON, err := json.Marshal(desired)
+	if err != nil {
+		return "", false
+	}
+	return string(wsJSON), false
+}
+
+// resolveContent returns what to send to the RAG server. A note is sent as the
+// markdown it renders to, under a name given the markdown extension.
+func resolveContent(inst *instance.Instance, change couchdb.Change) (string, io.ReadCloser, error) {
+	name, _ := change.Doc.Get("name").(string)
+	mime, _ := change.Doc.Get("mime").(string)
+
+	if mime == consts.NoteMimeType {
+		metadata, _ := change.Doc.Get("metadata").(map[string]interface{})
+		schema, _ := metadata["schema"].(map[string]interface{})
+		raw, _ := metadata["content"].(map[string]interface{})
+		noteDoc := &note.Document{
+			DocID:      change.DocID,
+			SchemaSpec: schema,
+			RawContent: raw,
+		}
+		md, err := noteDoc.Markdown(nil)
+		if err != nil {
+			return "", nil, err
+		}
+		// See https://github.com/OpenLLM-France/RAGondin/issues/88
+		name = strings.TrimSuffix(name, consts.NoteExtension) + consts.MarkdownExtension
+		return name, io.NopCloser(bytes.NewReader(md)), nil
+	}
+
+	dirID, _ := change.Doc.Get("dir_id").(string)
+	internalID, _ := change.Doc.Get("internal_vfs_id").(string)
+	f, err := inst.VFS().OpenFile(&vfs.FileDoc{
+		Type:       consts.FileType,
+		DocID:      change.DocID,
+		DirID:      dirID,
+		DocName:    name,
+		InternalID: internalID,
+	})
+	if err != nil {
+		return "", nil, err
+	}
+	if strings.HasSuffix(name, consts.DocsExtension) {
+		// See https://github.com/OpenLLM-France/RAGondin/issues/88
+		name = strings.TrimSuffix(name, consts.DocsExtension) + consts.MarkdownExtension
+	}
+	return name, f, nil
+}
+
+// ragUpload is what the RAG server needs to index one file.
+type ragUpload struct {
+	Server      config.RAGServer
+	Domain      string
+	FileID      string
+	Name        string
+	DirID       string
+	MD5Sum      string
+	Meta        map[string]string
+	Workspaces  string
+	CallbackURL string
+	IsNew       bool
+}
+
+func uploadToRAG(up ragUpload, content io.Reader) (*http.Response, error) {
+	u, err := url.Parse(up.Server.URL)
+	if err != nil {
+		return nil, err
+	}
+	u.Path = fmt.Sprintf("/indexer/partition/%s/file/%s", up.Domain, up.FileID)
+	u.RawQuery = url.Values{
+		"dir_id": []string{up.DirID},
+		"name":   []string{up.Name},
+		"md5sum": []string{up.MD5Sum},
+	}.Encode()
+
+	pr, pw := io.Pipe()
+	writer := multipart.NewWriter(pw)
+	go func() {
+		defer pw.Close()
+		defer writer.Close()
+
+		part, err := writer.CreateFormFile("file", up.Name)
+		if err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+		if _, err := io.Copy(part, content); err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+		// No need to add filename here, it is already set through the file form
+		ragMetadata, err := json.Marshal(up.Meta)
+		if err != nil {
+			_ = pw.CloseWithError(err)
+			return
+		}
+		fields := map[string]string{
+			"metadata":     string(ragMetadata),
+			"callback_url": up.CallbackURL,
+		}
+		if up.Workspaces != "" {
+			fields["workspace_ids"] = up.Workspaces
+		}
+		for field, value := range fields {
+			if err := writer.WriteField(field, value); err != nil {
+				_ = pw.CloseWithError(err)
+				return
+			}
+		}
+	}()
+
+	method := http.MethodPut
+	if up.IsNew {
+		method = http.MethodPost
+	}
+	req, err := http.NewRequest(method, u.String(), pr)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Add(echo.HeaderAuthorization, "Bearer "+up.Server.APIKey)
+	req.Header.Add("Content-Type", writer.FormDataContentType())
+	return ragHTTPClient.Do(req)
+}
+
+const md5Length = 16
+
+// decodeMD5Sum turns the md5sum carried by the changes feed into the
+// hexadecimal digest the RAG server is given. CouchDB serializes the bytes of
+// the digest in base64.
+func decodeMD5Sum(v interface{}) string {
+	s, _ := v.(string)
+	if s == "" {
+		return ""
+	}
+	if raw, err := hex.DecodeString(s); err == nil && len(raw) == md5Length {
+		return strings.ToLower(s)
+	}
+	raw, err := base64.StdEncoding.DecodeString(s)
+	if err != nil || len(raw) != md5Length {
+		return ""
+	}
+	return hex.EncodeToString(raw)
 }
 
 // getLastSeqNumber returns the last sequence number of the previous

@@ -18,9 +18,8 @@ type statusMessage struct {
 	DocID     string `json:"file_id"`
 	Status    string `json:"status"`    // "success" | "error" | "notsupported"
 	Timestamp string `json:"timestamp"` // RFC3339Nano
-	// The indexer echoes back the metadata it was given; only the revision of
-	// the document the status is about is read. Callbacks are ordered on it.
-	Metadata struct {
+	Metadata  struct {
+		// The _rev of the io.cozy.files document when it was sent for indexation.
 		DocRev string `json:"doc_rev"`
 	} `json:"metadata"`
 }

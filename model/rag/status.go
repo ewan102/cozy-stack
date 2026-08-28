@@ -70,6 +70,20 @@ func SetIndexStatus(inst *instance.Instance, docID, newStatus, rev string, times
 	return couchdb.Upsert(inst, doc)
 }
 
+// DeleteIndexStatus removes the indexation status of a document. One that never
+// had a status is not an error.
+func DeleteIndexStatus(inst *instance.Instance, docID string) error {
+	var doc IndexStatus
+	err := couchdb.GetDoc(inst, consts.ChatRAG, docID, &doc)
+	if err != nil {
+		if couchdb.IsNotFoundError(err) || couchdb.IsNoDatabaseError(err) {
+			return nil
+		}
+		return err
+	}
+	return couchdb.DeleteDoc(inst, &doc)
+}
+
 // isOutdated reports whether a callback is older than the stored status. Two
 // callbacks about the same revision describe the same indexation, so the last
 // one is kept.
