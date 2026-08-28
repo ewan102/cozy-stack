@@ -8,15 +8,17 @@ import (
 	"github.com/cozy/cozy-stack/pkg/jsonapi"
 )
 
-// IndexStatus is the RAG indexation status of a file. Its identifier is the
-// identifier of the file it describes.
+// IndexStatus is the RAG indexation status of a document. Its identifier is
+// the identifier of the document it describes.
 type IndexStatus struct {
-	DocID  string `json:"_id,omitempty"`
-	DocRev string `json:"_rev,omitempty"`
+	CouchID  string `json:"_id,omitempty"`
+	CouchRev string `json:"_rev,omitempty"`
 
-	Indexed         bool       `json:"indexed"`
-	Status          string     `json:"status,omitempty"`
-	FileRev         string     `json:"fileRev,omitempty"`
+	Indexed bool   `json:"indexed"`
+	Status  string `json:"status,omitempty"`
+	// Revision of the io.cozy.files document this status describes. Callbacks
+	// are ordered on it.
+	DocRev          string     `json:"docRev,omitempty"`
 	LastSuccessDate *time.Time `json:"lastSuccessDate,omitempty"`
 	LastErrorDate   *time.Time `json:"lastErrorDate,omitempty"`
 
@@ -26,11 +28,11 @@ type IndexStatus struct {
 	Rels jsonapi.RelationshipMap `json:"relationships,omitempty"`
 }
 
-func (s *IndexStatus) ID() string        { return s.DocID }
-func (s *IndexStatus) Rev() string       { return s.DocRev }
+func (s *IndexStatus) ID() string        { return s.CouchID }
+func (s *IndexStatus) Rev() string       { return s.CouchRev }
 func (s *IndexStatus) DocType() string   { return consts.ChatRAG }
-func (s *IndexStatus) SetID(id string)   { s.DocID = id }
-func (s *IndexStatus) SetRev(rev string) { s.DocRev = rev }
+func (s *IndexStatus) SetID(id string)   { s.CouchID = id }
+func (s *IndexStatus) SetRev(rev string) { s.CouchRev = rev }
 
 func (s *IndexStatus) Clone() couchdb.Doc {
 	cloned := *s
@@ -51,15 +53,15 @@ func (s *IndexStatus) Clone() couchdb.Doc {
 	return &cloned
 }
 
-func NewIndexStatus(fileID string) *IndexStatus {
+func NewIndexStatus(docID string) *IndexStatus {
 	return &IndexStatus{
-		DocID: fileID,
+		CouchID: docID,
 		Rels: jsonapi.RelationshipMap{
-			"file": jsonapi.Relationship{
+			"doc": jsonapi.Relationship{
 				Data: struct {
 					ID   string `json:"_id"`
 					Type string `json:"_type"`
-				}{ID: fileID, Type: consts.Files},
+				}{ID: docID, Type: consts.Files},
 			},
 		},
 	}

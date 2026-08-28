@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/cozy/cozy-stack/model/instance"
+	"github.com/cozy/cozy-stack/pkg/config/config"
 	"github.com/cozy/cozy-stack/pkg/consts"
 	"github.com/cozy/cozy-stack/pkg/couchdb"
 	"github.com/cozy/cozy-stack/pkg/couchdb/revision"
@@ -22,50 +23,61 @@ const (
 // callback_url given to the indexer.
 const IndexStatusPath = "/ai/index/status"
 
-func SetIndexStatus(inst *instance.Instance, fileID, newStatus, rev string, timestamp time.Time) error {
+func SetIndexStatus(inst *instance.Instance, docID, newStatus, rev string, timestamp time.Time) error {
 	if timestamp.IsZero() {
 		timestamp = time.Now()
 	}
 	log := inst.Logger().WithNamespace("rag")
 
+	// couchdb.Upsert overwrites the revision it finds instead of raising a
+	// conflict, so every read this decision rests on must be under the lock.
+	mu := config.Lock().ReadWrite(inst, "rag/index-status/"+docID)
+	if err := mu.Lock(); err != nil {
+		return err
+	}
+	defer mu.Unlock()
+
 	// A missing file is a no-op: it may have been deleted before its callback.
-	if _, err := inst.VFS().FileByID(fileID); err != nil {
+	file, err := inst.VFS().FileByID(docID)
+	if err != nil {
 		if couchdb.IsNotFoundError(err) || errors.Is(err, os.ErrNotExist) {
 			return nil
 		}
 		return err
 	}
+	// A trashed file is out of the index: a callback still in flight must not
+	// claim it is indexed.
+	if file.Trashed {
+		return nil
+	}
 
-	doc := NewIndexStatus(fileID)
-	err := couchdb.GetDoc(inst, consts.ChatRAG, fileID, doc)
+	doc := NewIndexStatus(docID)
+	err = couchdb.GetDoc(inst, consts.ChatRAG, docID, doc)
 	switch {
 	case err == nil:
-		// Dropped whole: such a callback must not claim the file is indexed, as
-		// a more recent status (e.g. a delete) may say otherwise.
-		if isOutdated(rev, doc.FileRev) {
-			log.Debugf("SetIndexStatus: dropping status=%s on %s (outdated file revision)", newStatus, fileID)
+		if isOutdated(rev, doc.DocRev) {
+			log.Debugf("SetIndexStatus: dropping status=%s on %s (outdated revision)", newStatus, docID)
 			return nil
 		}
 	case couchdb.IsNotFoundError(err) || couchdb.IsNoDatabaseError(err):
-		doc = NewIndexStatus(fileID)
+		doc = NewIndexStatus(docID)
 	default:
 		return err
 	}
 
-	// Kept so that a client can tell whether the current revision of the file
-	// is the one this status describes.
-	doc.FileRev = rev
+	doc.DocRev = rev
 	applyStatus(doc, newStatus, timestamp)
 	return couchdb.Upsert(inst, doc)
 }
 
-// isOutdated reports whether a callback about the rev revision of a file is not
-// newer than the stored one.
+// isOutdated reports whether a callback is older than the stored status. Two
+// callbacks about the same revision describe the same indexation, so the last
+// one is kept.
 func isOutdated(rev, storedRev string) bool {
 	if rev == "" || storedRev == "" {
 		return false
 	}
-	return revision.Generation(rev) <= revision.Generation(storedRev)
+	return revision.Generation(rev) < revision.Generation(storedRev)
 }
 
 func applyStatus(doc *IndexStatus, newStatus string, timestamp time.Time) {

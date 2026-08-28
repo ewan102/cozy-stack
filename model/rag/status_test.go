@@ -50,7 +50,7 @@ func TestApplyStatus(t *testing.T) {
 
 func TestIsOutdated(t *testing.T) {
 	assert.True(t, isOutdated("2-abc", "3-def"))  // an older revision
-	assert.True(t, isOutdated("3-abc", "3-def"))  // the revision already stored
+	assert.False(t, isOutdated("3-abc", "3-def")) // the revision already stored
 	assert.False(t, isOutdated("4-abc", "3-def")) // a newer revision
 	assert.False(t, isOutdated("", "3-def"))      // no revision in the callback
 	assert.False(t, isOutdated("3-abc", ""))      // nothing stored yet

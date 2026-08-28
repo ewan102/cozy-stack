@@ -23,17 +23,17 @@ func TestNewIndexStatus(t *testing.T) {
 
 	var out struct {
 		Rels struct {
-			File struct {
+			Doc struct {
 				Data struct {
 					ID   string `json:"_id"`
 					Type string `json:"_type"`
 				} `json:"data"`
-			} `json:"file"`
+			} `json:"doc"`
 		} `json:"relationships"`
 	}
 	require.NoError(t, json.Unmarshal(raw, &out))
-	assert.Equal(t, "a1b2c3", out.Rels.File.Data.ID)
-	assert.Equal(t, consts.Files, out.Rels.File.Data.Type)
+	assert.Equal(t, "a1b2c3", out.Rels.Doc.Data.ID)
+	assert.Equal(t, consts.Files, out.Rels.Doc.Data.Type)
 }
 
 func TestIndexStatusClone(t *testing.T) {
@@ -46,9 +46,9 @@ func TestIndexStatusClone(t *testing.T) {
 	other := at.Add(time.Hour)
 	cloned.LastSuccessDate = &other
 	cloned.Indexed = false
-	delete(cloned.Rels, "file")
+	delete(cloned.Rels, "doc")
 
 	assert.True(t, doc.Indexed)
 	assert.Equal(t, at, *doc.LastSuccessDate)
-	assert.Contains(t, doc.Rels, "file")
+	assert.Contains(t, doc.Rels, "doc")
 }

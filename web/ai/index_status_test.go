@@ -55,7 +55,7 @@ func TestIndexStatus(t *testing.T) {
 			"file_id":   doc.DocID,
 			"status":    "success",
 			"timestamp": at.Format(time.RFC3339Nano),
-			"metadata":  map[string]interface{}{"version": doc.Rev()},
+			"metadata":  map[string]interface{}{"doc_rev": doc.Rev()},
 		}).Status(204)
 
 		status := getStatus(t, inst, doc.DocID)
@@ -75,12 +75,12 @@ func TestIndexStatus(t *testing.T) {
 			"file_id":   doc.DocID,
 			"status":    "success",
 			"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
-			"metadata":  map[string]interface{}{"version": doc.Rev()},
+			"metadata":  map[string]interface{}{"doc_rev": doc.Rev()},
 		}).Status(204)
 
 		status := getStatus(t, inst, doc.DocID)
 		require.Equal(t, doc.DocID, status.ID())
-		rel, ok := status.Rels["file"]
+		rel, ok := status.Rels["doc"]
 		require.True(t, ok)
 		data, ok := rel.Data.(map[string]interface{})
 		require.True(t, ok)
@@ -99,7 +99,7 @@ func TestIndexStatus(t *testing.T) {
 			"file_id":   doc.DocID,
 			"status":    "error",
 			"timestamp": at.Format(time.RFC3339Nano),
-			"metadata":  map[string]interface{}{"version": doc.Rev()},
+			"metadata":  map[string]interface{}{"doc_rev": doc.Rev()},
 		}).Status(204)
 
 		status := getStatus(t, inst, doc.DocID)
@@ -120,7 +120,7 @@ func TestIndexStatus(t *testing.T) {
 			"file_id":   doc.DocID,
 			"status":    "success",
 			"timestamp": now.Add(-time.Hour).Format(time.RFC3339Nano),
-			"metadata":  map[string]interface{}{"version": "3-" + strings.Repeat("a", 32)},
+			"metadata":  map[string]interface{}{"doc_rev": "3-" + strings.Repeat("a", 32)},
 		}).Status(204)
 
 		postStatus(t, map[string]interface{}{
@@ -128,7 +128,7 @@ func TestIndexStatus(t *testing.T) {
 			"file_id":   doc.DocID,
 			"status":    "notsupported",
 			"timestamp": now.Format(time.RFC3339Nano),
-			"metadata":  map[string]interface{}{"version": "4-" + strings.Repeat("b", 32)},
+			"metadata":  map[string]interface{}{"doc_rev": "4-" + strings.Repeat("b", 32)},
 		}).Status(204)
 
 		status := getStatus(t, inst, doc.DocID)
@@ -149,7 +149,7 @@ func TestIndexStatus(t *testing.T) {
 			"file_id":   doc.DocID,
 			"status":    "success",
 			"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
-			"metadata":  map[string]interface{}{"version": "5-" + strings.Repeat("a", 32)},
+			"metadata":  map[string]interface{}{"doc_rev": "5-" + strings.Repeat("a", 32)},
 		}).Status(204)
 
 		// A revision that is not newer than the stored one means the callback
@@ -160,7 +160,7 @@ func TestIndexStatus(t *testing.T) {
 			"file_id":   doc.DocID,
 			"status":    "error",
 			"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
-			"metadata":  map[string]interface{}{"version": "3-" + strings.Repeat("b", 32)},
+			"metadata":  map[string]interface{}{"doc_rev": "3-" + strings.Repeat("b", 32)},
 		}).Status(204)
 
 		status := getStatus(t, inst, doc.DocID)
@@ -179,10 +179,10 @@ func TestIndexStatus(t *testing.T) {
 			"file_id":   doc.DocID,
 			"status":    "success",
 			"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
-			"metadata":  map[string]interface{}{"version": doc.Rev()},
+			"metadata":  map[string]interface{}{"doc_rev": doc.Rev()},
 		}).Status(204)
 
-		require.Equal(t, doc.Rev(), getStatus(t, inst, doc.DocID).FileRev)
+		require.Equal(t, doc.Rev(), getStatus(t, inst, doc.DocID).DocRev)
 	})
 
 	t.Run("a callback without a revision returns a 400", func(t *testing.T) {
@@ -198,7 +198,7 @@ func TestIndexStatus(t *testing.T) {
 			"partition": inst.Domain,
 			"file_id":   "any-file-id",
 			"status":    "weird",
-			"metadata":  map[string]interface{}{"version": "1-abc"},
+			"metadata":  map[string]interface{}{"doc_rev": "1-abc"},
 		}).Status(400)
 	})
 
@@ -207,7 +207,7 @@ func TestIndexStatus(t *testing.T) {
 			"partition": "somewhere-else.cozy.example",
 			"file_id":   "any-file-id",
 			"status":    "success",
-			"metadata":  map[string]interface{}{"version": "1-abc"},
+			"metadata":  map[string]interface{}{"doc_rev": "1-abc"},
 		}).Status(400)
 	})
 
@@ -215,7 +215,7 @@ func TestIndexStatus(t *testing.T) {
 		postStatus(t, map[string]interface{}{
 			"partition": inst.Domain,
 			"status":    "success",
-			"metadata":  map[string]interface{}{"version": "1-abc"},
+			"metadata":  map[string]interface{}{"doc_rev": "1-abc"},
 		}).Status(400)
 	})
 
@@ -228,7 +228,7 @@ func TestIndexStatus(t *testing.T) {
 			"partition": inst.Domain,
 			"file_id":   doc.DocID,
 			"status":    "success",
-			"metadata":  map[string]interface{}{"version": doc.Rev()},
+			"metadata":  map[string]interface{}{"doc_rev": doc.Rev()},
 		}).Status(204)
 
 		require.NotNil(t, getStatus(t, inst, doc.DocID).LastSuccessDate)
@@ -244,7 +244,7 @@ func TestIndexStatus(t *testing.T) {
 			"file_id":   doc.DocID,
 			"status":    "success",
 			"timestamp": "not-a-date",
-			"metadata":  map[string]interface{}{"version": doc.Rev()},
+			"metadata":  map[string]interface{}{"doc_rev": doc.Rev()},
 		}).Status(204)
 
 		require.NotNil(t, getStatus(t, inst, doc.DocID).LastSuccessDate)
@@ -255,15 +255,15 @@ func TestIndexStatus(t *testing.T) {
 			"partition": inst.Domain,
 			"file_id":   "non-existent-file-id",
 			"status":    "success",
-			"metadata":  map[string]interface{}{"version": "1-abc"},
+			"metadata":  map[string]interface{}{"doc_rev": "1-abc"},
 		}).Status(204)
 	})
 }
 
-func getStatus(t *testing.T, inst *instance.Instance, fileID string) *rag.IndexStatus {
+func getStatus(t *testing.T, inst *instance.Instance, docID string) *rag.IndexStatus {
 	t.Helper()
 	var status rag.IndexStatus
-	require.NoError(t, couchdb.GetDoc(inst, consts.ChatRAG, fileID, &status))
+	require.NoError(t, couchdb.GetDoc(inst, consts.ChatRAG, docID, &status))
 	return &status
 }
 

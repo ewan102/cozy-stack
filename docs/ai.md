@@ -44,9 +44,9 @@ can be indexed by enabling the following feature flags:
 
 ### POST /ai/index/status
 
-The RAG indexer reports the indexation status of a file on this route. The
+The RAG indexer reports the indexation status of a document on this route. The
 status is saved on an `io.cozy.ai.chat.rag` document whose identifier is the
-identifier of the file.
+identifier of the document it describes. Only files are indexed for now.
 
 This route has no authentication yet.
 
@@ -65,16 +65,21 @@ Content-Type: application/json
   "status": "success",
   "timestamp": "2026-08-28T13:24:07.576Z",
   "metadata": {
-    "version": "3-6a1b0b8a51a4e0e0a3b7f0f1d2c3b4a5"
+    "doc_rev": "3-6a1b0b8a51a4e0e0a3b7f0f1d2c3b4a5",
+    "datetime": "2026-08-20T08:12:00.000Z",
+    "doctype": "io.cozy.files"
   }
 }
 ```
 
-The `status` can be `success`, `error` or `notsupported`. The `version` is the
-revision of the file the status is about, as it was given to the indexer. It is
-mandatory: callbacks are ordered on it, and it is saved on the status document
-so that a client can tell whether the current revision of the file is the one
+The `status` can be `success`, `error` or `notsupported`. The `doc_rev` is the
+revision of the document the status is about, as it was given to the indexer. It
+is mandatory: callbacks are ordered on it, and a callback that carries none
+cannot be placed. It is saved on the status document as `docRev`, so that a
+client can tell whether the current revision of the document is the one
 described.
+
+The indexer echoes back more than `doc_rev`, but the other fields are ignored.
 
 #### Response
 
@@ -86,8 +91,9 @@ A callback is answered with a `400 Bad Request` when its payload is invalid or
 when its partition is not this instance, and with a `500 Internal Server Error`
 when the status could not be saved.
 
-A callback about a revision that is not newer than the one already saved is
-accepted but not saved, and answered with a `204`.
+A callback about a revision older than the one already saved is accepted but not
+saved, and answered with a `204`. One about the same revision describes the same
+indexation and is saved.
 
 ## openRAG
 

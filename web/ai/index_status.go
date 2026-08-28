@@ -15,13 +15,13 @@ import (
 // statusMessage is the payload posted by the RAG indexer on the callback URL.
 type statusMessage struct {
 	Partition string `json:"partition"`
-	FileID    string `json:"file_id"`
+	DocID     string `json:"file_id"`
 	Status    string `json:"status"`    // "success" | "error" | "notsupported"
 	Timestamp string `json:"timestamp"` // RFC3339Nano
-	// The "version" field holds the revision of the file the status is about.
-	// Callbacks are ordered on it.
+	// The indexer echoes back the metadata it was given; only the revision of
+	// the document the status is about is read. Callbacks are ordered on it.
 	Metadata struct {
-		Version string `json:"version"`
+		DocRev string `json:"doc_rev"`
 	} `json:"metadata"`
 }
 
@@ -45,13 +45,13 @@ func IndexStatus(c echo.Context) error {
 	if err := c.Bind(&msg); err != nil {
 		return badRequest(err)
 	}
-	if msg.FileID == "" {
+	if msg.DocID == "" {
 		return badRequest(errors.New("missing file_id in payload"))
 	}
 	// Callbacks are ordered on the file revision they carry, so one without it
 	// cannot be placed and is refused.
-	if msg.Metadata.Version == "" {
-		return badRequest(fmt.Errorf("missing metadata.version for file %s", msg.FileID))
+	if msg.Metadata.DocRev == "" {
+		return badRequest(fmt.Errorf("missing metadata.doc_rev for doc %s", msg.DocID))
 	}
 
 	// The partition is the domain the file was sent for indexation from. A
@@ -64,7 +64,7 @@ func IndexStatus(c echo.Context) error {
 	switch msg.Status {
 	case rag.StatusSuccess, rag.StatusError, rag.StatusNotSupported:
 	default:
-		return badRequest(fmt.Errorf("unknown status %q for file %s", msg.Status, msg.FileID))
+		return badRequest(fmt.Errorf("unknown status %q for doc %s", msg.Status, msg.DocID))
 	}
 
 	var ts time.Time
@@ -72,19 +72,19 @@ func IndexStatus(c echo.Context) error {
 		var err error
 		ts, err = time.Parse(time.RFC3339Nano, msg.Timestamp)
 		if err != nil {
-			log.Warnf("index status: invalid timestamp %q for file %s, using now", msg.Timestamp, msg.FileID)
+			log.Warnf("index status: invalid timestamp %q for doc %s, using now", msg.Timestamp, msg.DocID)
 			ts = time.Now()
 		}
 	} else {
-		log.Warnf("index status: missing timestamp for file %s, using now", msg.FileID)
+		log.Warnf("index status: missing timestamp for doc %s, using now", msg.DocID)
 		ts = time.Now()
 	}
 
-	log.Debugf("index status: file %s status=%s ts=%s", msg.FileID, msg.Status, ts)
+	log.Debugf("index status: doc %s status=%s ts=%s", msg.DocID, msg.Status, ts)
 
-	if err := rag.SetIndexStatus(inst, msg.FileID, msg.Status, msg.Metadata.Version, ts); err != nil {
+	if err := rag.SetIndexStatus(inst, msg.DocID, msg.Status, msg.Metadata.DocRev, ts); err != nil {
 		// The indexer does not replay a failed callback: this status is lost.
-		log.Errorf("index status: cannot save status=%s for file %s: %s", msg.Status, msg.FileID, err)
+		log.Errorf("index status: cannot save status=%s for doc %s: %s", msg.Status, msg.DocID, err)
 		return jsonapi.InternalServerError(err)
 	}
 	return c.NoContent(http.StatusNoContent)
