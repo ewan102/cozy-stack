@@ -42,6 +42,53 @@ can be indexed by enabling the following feature flags:
 - `rag.index.video.enabled`
 - `rag.index.audio.enabled`
 
+### POST /ai/index/status
+
+The RAG indexer reports the indexation status of a file on this route. The
+status is saved on an `io.cozy.ai.chat.rag` document whose identifier is the
+identifier of the file.
+
+This route has no authentication yet.
+
+#### Request
+
+```http
+POST /ai/index/status HTTP/1.1
+Host: alice.example.net
+Content-Type: application/json
+```
+
+```json
+{
+  "partition": "alice.example.net",
+  "file_id": "e21dce8058b9013d800a18c04daba326",
+  "status": "success",
+  "timestamp": "2026-08-28T13:24:07.576Z",
+  "metadata": {
+    "version": "3-6a1b0b8a51a4e0e0a3b7f0f1d2c3b4a5"
+  }
+}
+```
+
+The `status` can be `success`, `error` or `notsupported`. The `version` is the
+revision of the file the status is about, as it was given to the indexer. It is
+mandatory: callbacks are ordered on it, and it is saved on the status document
+so that a client can tell whether the current revision of the file is the one
+described.
+
+#### Response
+
+```http
+HTTP/1.1 204 No Content
+```
+
+A callback is answered with a `400 Bad Request` when its payload is invalid or
+when its partition is not this instance, and with a `500 Internal Server Error`
+when the status could not be saved.
+
+A callback about a revision that is not newer than the one already saved is
+accepted but not saved, and answered with a `204`.
+
 ## openRAG
 
 Some openRAG API are directly exposed through cozy-stack.

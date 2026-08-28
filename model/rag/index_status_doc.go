@@ -16,6 +16,7 @@ type IndexStatus struct {
 
 	Indexed         bool       `json:"indexed"`
 	Status          string     `json:"status,omitempty"`
+	FileRev         string     `json:"fileRev,omitempty"`
 	LastSuccessDate *time.Time `json:"lastSuccessDate,omitempty"`
 	LastErrorDate   *time.Time `json:"lastErrorDate,omitempty"`
 
