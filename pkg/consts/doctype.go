@@ -151,4 +151,6 @@ const (
 	ChatConversations = "io.cozy.ai.chat.conversations"
 	// ChatEvents doc type is used for RAG events about a chat conversation.
 	ChatEvents = "io.cozy.ai.chat.events"
+	// ChatRAG doc type is used for the RAG indexation status of a file.
+	ChatRAG = "io.cozy.ai.chat.rag"
 )
