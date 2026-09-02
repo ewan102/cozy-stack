@@ -84,12 +84,10 @@ func callRAGIndexer(inst *instance.Instance, doctype string, change couchdb.Chan
 	}
 
 	if change.Doc.Get("type") == consts.DirType {
-		// A directory move or rename rewrites the path of the directory and
-		// of all its descendant directories, but never touches the file docs
-		// they contain: those files may have silently entered or left a
-		// knowledge-base folder. Every descendant directory shows up in this
-		// same changes feed, so reconciling the direct file children of each
-		// changed directory covers the whole moved subtree.
+		// Moving a directory rewrites the path of every descendant directory
+		// but never touches the file docs, which may have silently entered or
+		// left a knowledge-base folder. Each descendant shows up in this same
+		// feed, so reconciling the direct children covers the whole subtree.
 		dirPath, _ := change.Doc.Get("path").(string)
 		if dirPath != "" && !strings.HasPrefix(dirPath, vfs.TrashDirName) {
 			reconcileDirChildren(inst, logger, kb(), change.DocID, dirPath)
@@ -105,7 +103,8 @@ func callRAGIndexer(inst *instance.Instance, doctype string, change couchdb.Chan
 
 	class, _ := change.Doc.Get("class").(string)
 	if !isClassAllowed(flags, class) {
-		return markNotSupported(inst, change)
+		rev, _ := change.Doc.Get("_rev").(string)
+		return SetIndexStatus(inst, change.DocID, StatusNotSupported, rev)
 	}
 
 	if change.Deleted || change.Doc.Get("trashed") == true {
@@ -127,13 +126,6 @@ func isClassAllowed(flags *feature.Flags, class string) bool {
 		return allowed
 	}
 	return true
-}
-
-// markNotSupported records a status no emitter ever reports: it is the stack
-// that decides a file will not be indexed.
-func markNotSupported(inst *instance.Instance, change couchdb.Change) error {
-	rev, _ := change.Doc.Get("_rev").(string)
-	return SetIndexStatus(inst, change.DocID, StatusNotSupported, rev)
 }
 
 func deleteFromRAG(inst *instance.Instance, fileID string) error {
@@ -175,8 +167,7 @@ func needsIndexation(inst *instance.Instance, fileID, md5sum string) (needed, is
 }
 
 // indexedMD5Sum returns the md5sum the RAG server holds for the file. known is
-// false when it does not know the file at all, which decides between a POST
-// and a PUT.
+// false when it does not know the file at all.
 func indexedMD5Sum(server config.RAGServer, domain, fileID string) (md5sum string, known bool, err error) {
 	path := fmt.Sprintf("/partition/%s/file/%s", domain, url.PathEscape(fileID))
 	res, err := callRAG(server, http.MethodGet, nil, path, echo.MIMEApplicationJSON)
@@ -269,12 +260,9 @@ func upsertToRAG(inst *instance.Instance, doctype string, change couchdb.Change,
 	}
 
 	if (!isNewFile || attachUnknown) && res.StatusCode < 300 {
-		// For an existing file, the content changed but it may also have
-		// been moved/renamed at the same time: keep the knowledge-base
-		// workspaces in sync after a successful re-upload. For a new file
-		// whose membership could not be resolved before the upload
-		// (attachUnknown), this is the only chance to attach it: retry
-		// now that the transient path-resolution error may have cleared.
+		// A re-upload may also have moved the file. And for a new file whose
+		// membership could not be resolved before the upload, this is the only
+		// chance to attach it, now that the transient error may have cleared.
 		reconcileMembership(inst, logger, kb(), change.DocID, dirID)
 	}
 	return nil
@@ -303,7 +291,7 @@ func resolveWorkspaces(inst *instance.Instance, logger logger.Logger, kbc *kbCon
 }
 
 // resolveContent returns what to send to the RAG server. A note is sent as the
-// markdown it renders to, under a name given the markdown extension.
+// markdown it renders to.
 func resolveContent(inst *instance.Instance, change couchdb.Change) (string, io.ReadCloser, error) {
 	name, _ := change.Doc.Get("name").(string)
 	mime, _ := change.Doc.Get("mime").(string)
@@ -345,7 +333,6 @@ func resolveContent(inst *instance.Instance, change couchdb.Change) (string, io.
 	return name, f, nil
 }
 
-// ragUpload is what the RAG server needs to index one file.
 type ragUpload struct {
 	Server      config.RAGServer
 	Domain      string
@@ -429,9 +416,6 @@ func decodeMD5Sum(v interface{}) string {
 	s, _ := v.(string)
 	if s == "" {
 		return ""
-	}
-	if raw, err := hex.DecodeString(s); err == nil && len(raw) == md5Length {
-		return strings.ToLower(s)
 	}
 	raw, err := base64.StdEncoding.DecodeString(s)
 	if err != nil || len(raw) != md5Length {

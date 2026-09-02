@@ -39,15 +39,11 @@ func TestDecodeMD5Sum(t *testing.T) {
 	// base64.
 	assert.Equal(t, hexSum, decodeMD5Sum(base64Sum))
 
-	assert.Equal(t, hexSum, decodeMD5Sum(hexSum))
-	assert.Equal(t, hexSum, decodeMD5Sum("098F6BCD4621D373CADE4E832627B4F6"))
-
 	assert.Equal(t, "", decodeMD5Sum(""))
 	assert.Equal(t, "", decodeMD5Sum(nil))
 	assert.Equal(t, "", decodeMD5Sum("not a digest"))
-	assert.Equal(t, "", decodeMD5Sum("dG9vIHNob3J0"))     // valid base64, 9 bytes
-	assert.Equal(t, "", decodeMD5Sum(map[string]int{}))   // not even a string
-	assert.Equal(t, "", decodeMD5Sum("098f6bcd4621d373")) // valid hex, 8 bytes
+	assert.Equal(t, "", decodeMD5Sum("dG9vIHNob3J0"))   // valid base64, 9 bytes
+	assert.Equal(t, "", decodeMD5Sum(map[string]int{})) // not even a string
 }
 
 func TestIsClassAllowed(t *testing.T) {

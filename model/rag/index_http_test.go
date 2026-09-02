@@ -1,11 +1,12 @@
 package rag
 
 import (
+	"bytes"
 	"encoding/json"
-	"io"
 	"mime"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -13,24 +14,17 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// formFields reads back the multipart body the RAG server received.
-func formFields(t *testing.T, contentType string, body []byte) map[string]string {
+// formFields reads back the multipart body the RAG server received. ReadForm
+// keeps the file part out of Value, so only the fields are returned.
+func formFields(t *testing.T, contentType string, body []byte) url.Values {
 	t.Helper()
 	_, params, err := mime.ParseMediaType(contentType)
 	require.NoError(t, err)
-	reader := multipart.NewReader(strings.NewReader(string(body)), params["boundary"])
 
-	fields := map[string]string{}
-	for {
-		part, err := reader.NextPart()
-		if err == io.EOF {
-			return fields
-		}
-		require.NoError(t, err)
-		content, err := io.ReadAll(part)
-		require.NoError(t, err)
-		fields[part.FormName()] = string(content)
-	}
+	form, err := multipart.NewReader(bytes.NewReader(body), params["boundary"]).ReadForm(int64(len(body)))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = form.RemoveAll() })
+	return form.Value
 }
 
 func TestUploadToRAG(t *testing.T) {
@@ -62,10 +56,10 @@ func TestUploadToRAG(t *testing.T) {
 		})
 
 		fields := formFields(t, contentType, req.Body)
-		assert.Equal(t, "https://alice.example.net/ai/index/status", fields["callback_url"])
+		assert.Equal(t, "https://alice.example.net/ai/index/status", fields.Get("callback_url"))
 
 		var meta map[string]string
-		require.NoError(t, json.Unmarshal([]byte(fields["metadata"]), &meta))
+		require.NoError(t, json.Unmarshal([]byte(fields.Get("metadata")), &meta))
 		assert.Equal(t, "3-abc", meta["doc_rev"])
 		assert.Equal(t, "io.cozy.files", meta["doctype"])
 	})
@@ -84,7 +78,7 @@ func TestUploadToRAG(t *testing.T) {
 		assert.NotContains(t, formFields(t, contentType, req.Body), "workspace_ids")
 
 		req, contentType = upload(t, ragUpload{FileID: "a1b2c3", Name: "note.txt", Workspaces: `["ws1"]`})
-		assert.Equal(t, `["ws1"]`, formFields(t, contentType, req.Body)["workspace_ids"])
+		assert.Equal(t, `["ws1"]`, formFields(t, contentType, req.Body).Get("workspace_ids"))
 	})
 }
 
