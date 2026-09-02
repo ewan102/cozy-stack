@@ -23,19 +23,25 @@ const (
 // callback_url given to the indexer.
 const IndexStatusPath = "/ai/index/status"
 
-func SetIndexStatus(inst *instance.Instance, docID, newStatus, rev string, timestamp time.Time) error {
-	if timestamp.IsZero() {
-		timestamp = time.Now()
-	}
-	log := inst.Logger().WithNamespace("rag")
-
-	// couchdb.Upsert overwrites the revision it finds instead of raising a
-	// conflict, so every read this decision rests on must be under the lock.
+// lockIndexStatus guards the read-check-write of a status document.
+// couchdb.Upsert overwrites the revision it finds instead of raising a conflict,
+// so a caller that decides from what it read must hold this lock until it writes.
+func lockIndexStatus(inst *instance.Instance, docID string) (func(), error) {
 	mu := config.Lock().ReadWrite(inst, "rag/index-status/"+docID)
 	if err := mu.Lock(); err != nil {
+		return nil, err
+	}
+	return mu.Unlock, nil
+}
+
+func SetIndexStatus(inst *instance.Instance, docID, newStatus, rev string) error {
+	log := inst.Logger().WithNamespace("rag")
+
+	unlock, err := lockIndexStatus(inst, docID)
+	if err != nil {
 		return err
 	}
-	defer mu.Unlock()
+	defer unlock()
 
 	// A missing file is a no-op: it may have been deleted before its callback.
 	file, err := inst.VFS().FileByID(docID)
@@ -66,15 +72,21 @@ func SetIndexStatus(inst *instance.Instance, docID, newStatus, rev string, times
 	}
 
 	doc.DocRev = rev
-	applyStatus(doc, newStatus, timestamp)
+	applyStatus(doc, newStatus)
 	return couchdb.Upsert(inst, doc)
 }
 
 // DeleteIndexStatus removes the indexation status of a document. One that never
 // had a status is not an error.
 func DeleteIndexStatus(inst *instance.Instance, docID string) error {
+	unlock, err := lockIndexStatus(inst, docID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
 	var doc IndexStatus
-	err := couchdb.GetDoc(inst, consts.ChatRAG, docID, &doc)
+	err = couchdb.GetDoc(inst, consts.ChatRAG, docID, &doc)
 	if err != nil {
 		if couchdb.IsNotFoundError(err) || couchdb.IsNoDatabaseError(err) {
 			return nil
@@ -94,14 +106,15 @@ func isOutdated(rev, storedRev string) bool {
 	return revision.Generation(rev) < revision.Generation(storedRev)
 }
 
-func applyStatus(doc *IndexStatus, newStatus string, timestamp time.Time) {
+func applyStatus(doc *IndexStatus, newStatus string) {
+	now := time.Now()
 	doc.Status = newStatus
 	switch newStatus {
 	case StatusSuccess:
 		doc.Indexed = true
-		doc.LastSuccessDate = &timestamp
+		doc.LastSuccessDate = &now
 	case StatusError:
 		// Indexed is preserved: stays true if the file was previously indexed.
-		doc.LastErrorDate = &timestamp
+		doc.LastErrorDate = &now
 	}
 }

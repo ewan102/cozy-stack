@@ -49,12 +49,10 @@ func TestIndexStatus(t *testing.T) {
 		doc := createStatusTestFile(t, fs, "rag-success.txt")
 		defer destroyStatusTestFile(t, fs, doc)
 
-		at := time.Now().UTC().Truncate(time.Second)
 		postStatus(t, map[string]interface{}{
 			"partition": inst.Domain,
 			"file_id":   doc.DocID,
 			"status":    "success",
-			"timestamp": at.Format(time.RFC3339Nano),
 			"metadata":  map[string]interface{}{"doc_rev": doc.Rev()},
 		}).Status(204)
 
@@ -74,7 +72,6 @@ func TestIndexStatus(t *testing.T) {
 			"partition": inst.Domain,
 			"file_id":   doc.DocID,
 			"status":    "success",
-			"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
 			"metadata":  map[string]interface{}{"doc_rev": doc.Rev()},
 		}).Status(204)
 
@@ -93,12 +90,10 @@ func TestIndexStatus(t *testing.T) {
 		doc := createStatusTestFile(t, fs, "rag-error.txt")
 		defer destroyStatusTestFile(t, fs, doc)
 
-		at := time.Now().UTC().Truncate(time.Second)
 		postStatus(t, map[string]interface{}{
 			"partition": inst.Domain,
 			"file_id":   doc.DocID,
 			"status":    "error",
-			"timestamp": at.Format(time.RFC3339Nano),
 			"metadata":  map[string]interface{}{"doc_rev": doc.Rev()},
 		}).Status(204)
 
@@ -114,12 +109,10 @@ func TestIndexStatus(t *testing.T) {
 		doc := createStatusTestFile(t, fs, "rag-notsupported.txt")
 		defer destroyStatusTestFile(t, fs, doc)
 
-		now := time.Now().UTC()
 		postStatus(t, map[string]interface{}{
 			"partition": inst.Domain,
 			"file_id":   doc.DocID,
 			"status":    "success",
-			"timestamp": now.Add(-time.Hour).Format(time.RFC3339Nano),
 			"metadata":  map[string]interface{}{"doc_rev": "3-" + strings.Repeat("a", 32)},
 		}).Status(204)
 
@@ -127,7 +120,6 @@ func TestIndexStatus(t *testing.T) {
 			"partition": inst.Domain,
 			"file_id":   doc.DocID,
 			"status":    "notsupported",
-			"timestamp": now.Format(time.RFC3339Nano),
 			"metadata":  map[string]interface{}{"doc_rev": "4-" + strings.Repeat("b", 32)},
 		}).Status(204)
 
@@ -148,7 +140,6 @@ func TestIndexStatus(t *testing.T) {
 			"partition": inst.Domain,
 			"file_id":   doc.DocID,
 			"status":    "success",
-			"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
 			"metadata":  map[string]interface{}{"doc_rev": "5-" + strings.Repeat("a", 32)},
 		}).Status(204)
 
@@ -159,7 +150,6 @@ func TestIndexStatus(t *testing.T) {
 			"partition": inst.Domain,
 			"file_id":   doc.DocID,
 			"status":    "error",
-			"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
 			"metadata":  map[string]interface{}{"doc_rev": "3-" + strings.Repeat("b", 32)},
 		}).Status(204)
 
@@ -178,7 +168,6 @@ func TestIndexStatus(t *testing.T) {
 			"partition": inst.Domain,
 			"file_id":   doc.DocID,
 			"status":    "success",
-			"timestamp": time.Now().UTC().Format(time.RFC3339Nano),
 			"metadata":  map[string]interface{}{"doc_rev": doc.Rev()},
 		}).Status(204)
 
@@ -217,37 +206,6 @@ func TestIndexStatus(t *testing.T) {
 			"status":    "success",
 			"metadata":  map[string]interface{}{"doc_rev": "1-abc"},
 		}).Status(400)
-	})
-
-	t.Run("missing timestamp falls back to now", func(t *testing.T) {
-		fs := inst.VFS()
-		doc := createStatusTestFile(t, fs, "rag-no-ts.txt")
-		defer destroyStatusTestFile(t, fs, doc)
-
-		postStatus(t, map[string]interface{}{
-			"partition": inst.Domain,
-			"file_id":   doc.DocID,
-			"status":    "success",
-			"metadata":  map[string]interface{}{"doc_rev": doc.Rev()},
-		}).Status(204)
-
-		require.NotNil(t, getStatus(t, inst, doc.DocID).LastSuccessDate)
-	})
-
-	t.Run("malformed timestamp falls back to now", func(t *testing.T) {
-		fs := inst.VFS()
-		doc := createStatusTestFile(t, fs, "rag-bad-ts.txt")
-		defer destroyStatusTestFile(t, fs, doc)
-
-		postStatus(t, map[string]interface{}{
-			"partition": inst.Domain,
-			"file_id":   doc.DocID,
-			"status":    "success",
-			"timestamp": "not-a-date",
-			"metadata":  map[string]interface{}{"doc_rev": doc.Rev()},
-		}).Status(204)
-
-		require.NotNil(t, getStatus(t, inst, doc.DocID).LastSuccessDate)
 	})
 
 	t.Run("non-existent file_id is a no-op", func(t *testing.T) {

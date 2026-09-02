@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"time"
 
 	"github.com/cozy/cozy-stack/model/rag"
 	"github.com/cozy/cozy-stack/pkg/jsonapi"
@@ -16,8 +15,7 @@ import (
 type statusMessage struct {
 	Partition string `json:"partition"`
 	DocID     string `json:"file_id"`
-	Status    string `json:"status"`    // "success" | "error" | "notsupported"
-	Timestamp string `json:"timestamp"` // RFC3339Nano
+	Status    string `json:"status"` // "success" | "error" | "notsupported"
 	Metadata  struct {
 		// The _rev of the io.cozy.files document when it was sent for indexation.
 		DocRev string `json:"doc_rev"`
@@ -66,22 +64,9 @@ func IndexStatus(c echo.Context) error {
 		return badRequest(fmt.Errorf("unknown status %q for doc %s", msg.Status, msg.DocID))
 	}
 
-	var ts time.Time
-	if msg.Timestamp != "" {
-		var err error
-		ts, err = time.Parse(time.RFC3339Nano, msg.Timestamp)
-		if err != nil {
-			log.Warnf("index status: invalid timestamp %q for doc %s, using now", msg.Timestamp, msg.DocID)
-			ts = time.Now()
-		}
-	} else {
-		log.Warnf("index status: missing timestamp for doc %s, using now", msg.DocID)
-		ts = time.Now()
-	}
+	log.Debugf("index status: doc %s status=%s", msg.DocID, msg.Status)
 
-	log.Debugf("index status: doc %s status=%s ts=%s", msg.DocID, msg.Status, ts)
-
-	if err := rag.SetIndexStatus(inst, msg.DocID, msg.Status, msg.Metadata.DocRev, ts); err != nil {
+	if err := rag.SetIndexStatus(inst, msg.DocID, msg.Status, msg.Metadata.DocRev); err != nil {
 		// The indexer does not replay a failed callback: this status is lost.
 		log.Errorf("index status: cannot save status=%s for doc %s: %s", msg.Status, msg.DocID, err)
 		return jsonapi.InternalServerError(err)

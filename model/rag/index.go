@@ -13,7 +13,6 @@ import (
 	"net/url"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/cozy/cozy-stack/model/feature"
 	"github.com/cozy/cozy-stack/model/instance"
@@ -134,7 +133,7 @@ func isClassAllowed(flags *feature.Flags, class string) bool {
 // that decides a file will not be indexed.
 func markNotSupported(inst *instance.Instance, change couchdb.Change) error {
 	rev, _ := change.Doc.Get("_rev").(string)
-	return SetIndexStatus(inst, change.DocID, StatusNotSupported, rev, time.Now())
+	return SetIndexStatus(inst, change.DocID, StatusNotSupported, rev)
 }
 
 func deleteFromRAG(inst *instance.Instance, fileID string) error {

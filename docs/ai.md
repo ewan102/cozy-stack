@@ -63,7 +63,6 @@ Content-Type: application/json
   "partition": "alice.example.net",
   "file_id": "e21dce8058b9013d800a18c04daba326",
   "status": "success",
-  "timestamp": "2026-08-28T13:24:07.576Z",
   "metadata": {
     "doc_rev": "3-6a1b0b8a51a4e0e0a3b7f0f1d2c3b4a5",
     "datetime": "2026-08-20T08:12:00.000Z",
